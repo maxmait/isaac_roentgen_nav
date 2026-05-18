@@ -27,8 +27,11 @@ Coordinate convention (fluorosim <-> Isaac Sim):
 from __future__ import annotations
 
 # Phantom isocenter pose in Isaac Sim world frame (meters / wxyz quaternion).
-# Picked to sit in the Franka workspace, above the ground plane.
-PHANTOM_POS_WORLD_M: tuple[float, float, float] = (0.5, 0.0, 0.3)
+# Picked to overlap the Franka rest-pose end-effector at ~(0.43, 0.015, 0.42) m
+# so the EE sits inside the CT volume bounds (±64 mm in each axis from the
+# isocenter). Without this overlap the robot tool would project outside the
+# X-ray beam and could never appear in the DRR.
+PHANTOM_POS_WORLD_M: tuple[float, float, float] = (0.43, 0.0, 0.42)
 PHANTOM_QUAT_WXYZ: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0)
 
 # Volume-local semiaxes in meters (Isaac Sim X, Y, Z order).

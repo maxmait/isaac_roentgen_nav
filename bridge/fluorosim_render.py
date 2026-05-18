@@ -21,6 +21,14 @@ the same world frame, so the fluorosim translation (which is volume-local) is
 
 Older pose.json files without a phantom_pos field default to phantom at the
 world origin (i.e. carm_pos itself is treated as the volume-local offset).
+
+Tool painting:
+    The robot end-effector is rendered into the DRR by burning a high-μ sphere
+    into the μ-volume at the EE voxel position before rendering. This is a
+    first-cut abstraction — the actual Franka hand mesh is not voxelized; we
+    just treat the tool as a dense metal blob centered at ee_pos. The painted
+    sphere is applied to an in-memory copy of the cached μ-volume so the disk
+    cache stays clean.
 """
 
 from __future__ import annotations
@@ -51,6 +59,14 @@ DRR_NPY = IO_DIR / "drr.npy"
 DRR_META = IO_DIR / "drr_meta.json"
 CACHE_DIR = IO_DIR / "fluorosim_cache"
 
+# Tool abstraction: dense sphere centered at the EE position.
+# - μ ≈ 0.5 mm⁻¹ is ~28× bone (~0.018) and makes the tool effectively opaque to
+#   X-rays (line-integral over a 30 mm chord ≈ 15 nepers → exp(−15) ≈ 0).
+# - 15 mm radius gives a ~30 mm-diameter blob, projecting to ~120 px at the
+#   detector under the default geometry (SDD/SID = 2, pixel_spacing = 0.5 mm).
+TOOL_RADIUS_MM: float = 15.0
+TOOL_MU_PER_MM: float = 0.5
+
 
 def quat_wxyz_to_euler_xyz(w: float, x: float, y: float, z: float) -> tuple[float, float, float]:
     """Convert a unit quaternion (w, x, y, z) to extrinsic XYZ Euler angles (rad)."""
@@ -66,6 +82,91 @@ def quat_wxyz_to_euler_xyz(w: float, x: float, y: float, z: float) -> tuple[floa
     cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
     yaw = math.atan2(siny_cosp, cosy_cosp)
     return (roll, pitch, yaw)
+
+
+def paint_tool_into_volume(
+    volume: PreprocessedVolume,
+    ee_pos_world: list[float],
+    phantom_pos_world: list[float],
+    tool_radius_mm: float = TOOL_RADIUS_MM,
+    tool_mu: float = TOOL_MU_PER_MM,
+) -> tuple[PreprocessedVolume, dict]:
+    """Burn a dense sphere into a copy of the μ-volume at the EE voxel and
+    return a new PreprocessedVolume wrapping the modified array.
+
+    The on-disk cache (mu_volume.npy) is untouched — the tool is dynamic per
+    render. PreprocessedVolume.mu_volume is a read-only property, so we
+    construct a fresh volume rather than mutating the input.
+
+    Returns:
+        new_volume   - PreprocessedVolume with tool burned into μ
+        info         - dict with diagnostic fields (voxels painted, voxel index,
+                       whether the tool sphere was fully inside the volume)
+    """
+    mu = volume.mu_volume.copy()  # (Z, Y, X)
+    spacing_zyx = np.asarray(volume.spacing_zyx_mm, dtype=np.float64)
+    shape = np.asarray(mu.shape, dtype=np.int64)
+
+    # World-frame offset of the EE from the phantom isocenter, in mm.
+    offset_world_xyz_mm = (
+        np.asarray(ee_pos_world, dtype=np.float64)
+        - np.asarray(phantom_pos_world, dtype=np.float64)
+    ) * 1000.0
+
+    # Axis remap: world (X, Y, Z) -> volume-local (X, Y, Z); array axes are (Z, Y, X).
+    offset_zyx_mm = offset_world_xyz_mm[[2, 1, 0]]
+
+    # Fractional voxel coordinate of the EE.
+    volume_center_voxel = (shape - 1) / 2.0
+    ee_voxel = volume_center_voxel + offset_zyx_mm / spacing_zyx
+
+    # Per-axis radius in voxels (anisotropic).
+    radius_voxels = tool_radius_mm / spacing_zyx
+    bb_min = np.maximum(np.zeros(3, dtype=np.int64),
+                        np.floor(ee_voxel - radius_voxels).astype(np.int64))
+    bb_max = np.minimum(shape,
+                        (np.ceil(ee_voxel + radius_voxels) + 1).astype(np.int64))
+
+    info: dict = {
+        "ee_voxel_zyx": ee_voxel.tolist(),
+        "tool_radius_mm": float(tool_radius_mm),
+        "tool_mu_per_mm": float(tool_mu),
+        "voxels_painted": 0,
+        "fully_inside_volume": bool(
+            np.all(ee_voxel - radius_voxels >= 0)
+            and np.all(ee_voxel + radius_voxels <= shape - 1)
+        ),
+    }
+
+    if np.any(bb_max <= bb_min):
+        print(f"  WARNING: tool sphere at EE voxel "
+              f"({ee_voxel[0]:.1f}, {ee_voxel[1]:.1f}, {ee_voxel[2]:.1f}) "
+              f"does not overlap the volume {tuple(shape)}; no voxels painted.")
+        return PreprocessedVolume(mu, volume._metadata), info
+
+    z = np.arange(bb_min[0], bb_max[0])
+    y = np.arange(bb_min[1], bb_max[1])
+    x = np.arange(bb_min[2], bb_max[2])
+    zz, yy, xx = np.meshgrid(z, y, x, indexing="ij")
+    dist_sq_mm = (
+        ((zz - ee_voxel[0]) * spacing_zyx[0]) ** 2
+        + ((yy - ee_voxel[1]) * spacing_zyx[1]) ** 2
+        + ((xx - ee_voxel[2]) * spacing_zyx[2]) ** 2
+    )
+    mask = dist_sq_mm <= tool_radius_mm ** 2
+
+    sub = mu[bb_min[0]:bb_max[0], bb_min[1]:bb_max[1], bb_min[2]:bb_max[2]]
+    sub[mask] = tool_mu
+
+    info["voxels_painted"] = int(mask.sum())
+    print(f"  Painted {info['voxels_painted']} voxels with μ={tool_mu:.3f} mm⁻¹ at "
+          f"EE voxel ({ee_voxel[0]:.1f}, {ee_voxel[1]:.1f}, {ee_voxel[2]:.1f}); "
+          f"radius {tool_radius_mm:.1f} mm.")
+    if not info["fully_inside_volume"]:
+        print(f"  NOTE: tool sphere partially extends past the volume bounds "
+              f"{tuple(shape)} — only the in-volume portion is painted.")
+
+    return PreprocessedVolume(mu, volume._metadata), info
 
 
 def load_or_build_synthetic_volume() -> PreprocessedVolume:
@@ -139,6 +240,9 @@ def main() -> int:
     volume = load_or_build_synthetic_volume()
     print(f"  {volume}")
 
+    print("\n[1b] Painting robot tool into μ-volume (in-memory copy)...")
+    volume, tool_info = paint_tool_into_volume(volume, ee_pos, phantom_pos_m)
+
     print("\n[2] Initializing simulator...")
     config = SimulatorConfig(
         geometry=CarmGeometry(
@@ -181,6 +285,7 @@ def main() -> int:
         "carm_local_m": carm_local_m,
         "fluorosim_rotation_rad": [rot_x, rot_y, rot_z],
         "fluorosim_translation_mm": [tx_mm, ty_mm, tz_mm],
+        "tool": tool_info,
         "image": {
             "shape": list(img.shape),
             "min": float(img.min()),

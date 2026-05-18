@@ -70,6 +70,20 @@ def main() -> int:
     print(f"  -> rotation (rad):     {meta['fluorosim_rotation_rad']}")
     print(f"  -> translation (mm):   {meta['fluorosim_translation_mm']}")
     print()
+    tool = meta.get("tool")
+    if tool is not None:
+        print("Tool (painted into μ-volume at EE position):")
+        print(f"  voxel (z, y, x):    "
+              f"({tool['ee_voxel_zyx'][0]:.1f}, "
+              f"{tool['ee_voxel_zyx'][1]:.1f}, "
+              f"{tool['ee_voxel_zyx'][2]:.1f})")
+        print(f"  radius:             {tool['tool_radius_mm']} mm  "
+              f"(μ = {tool['tool_mu_per_mm']} mm⁻¹)")
+        print(f"  voxels painted:     {tool['voxels_painted']}  "
+              f"(fully inside volume: {tool['fully_inside_volume']})")
+        if tool["voxels_painted"] == 0:
+            print("  WARNING: no voxels were painted — tool is outside the volume.")
+        print()
     stats = meta["image"]
     print(f"Image stats:  min={stats['min']:.4f}  max={stats['max']:.4f}  "
           f"mean={stats['mean']:.4f}  std={stats['std']:.4f}")
