@@ -50,6 +50,15 @@ using simulated fluoroscopy (DRR) and 2D/3D CT registration — entirely in soft
     fluorosim_render.py            # runs INSIDE the container; reads pose.json, renders DRR
     run_fluorosim.sh               # docker run wrapper with proper bind mounts
     visualize_drr.py               # host-side annotated viewer + flat-image sanity check
+    fluorosim_torch.Dockerfile     # builds `fluorosim-torch` (= fluorosim + PyTorch) for registration
+    register_phantom.py            # Phase 5: translation-only phantom-pose registration (single view)
+    run_register.sh                # docker run wrapper for register_phantom.py
+    plot_registration.py           # host-side: loss curve + parameter trajectory + image comparison
+    register_phantom_multiview.py  # Phase 5: clinical sequential AP + lateral C-arm shots
+    run_register_multiview.sh      # docker run wrapper for the multi-view registration
+    plot_registration_multiview.py # host-side: per-view losses + per-view target/recovered/diff panels
+    compute_robot_to_anatomy.py    # Phase 5 deliverable: composes registered phantom with EE pose
+                                   # → T_R^A, T_R^C, T_A^C + clinical inside/outside check
   docs/images/                     # screenshots committed to the repo (README assets)
   output/                          # runtime artifacts: pose.json, drr.*, fluorosim_cache/ (gitignored)
 
@@ -247,17 +256,59 @@ needing a separate GUI session.
       magnification at 0.5mm/px pixel spacing); confirms isocenter mapping
 - [x] verify_phantom.py inspects /World/Phantom/* prims in live GUI stage
 - [x] Viewport snapshot in snapshots/phantom_in_isaac.jpg shows prolate ellipsoid
-- [ ] Robot tool visible in DRR (needs Franka mesh contribution to attenuation —
-      requires either compositing or treating the robot as a high-density region)
-- [ ] Replace analytic ellipsoid with marching-cubes mesh once a real CT phantom
-      is sourced (DICOM/NIfTI)
+- [x] Phantom isocenter moved to (0.43, 0, 0.42) m so the Franka rest-pose EE
+      lies inside the volume bounds (±64 mm); previously the EE was 70 mm out
+      in X and 120 mm out in Z, so no tool blob could ever intersect a ray.
+- [x] paint_tool_into_volume() in fluorosim_render.py burns a 15 mm dense sphere
+      (μ=0.5 mm⁻¹, ~28× bone) at the EE voxel before each render; the cached
+      μ_volume.npy is left clean, the tool is applied to an in-memory copy.
+      Returns a new PreprocessedVolume because the public mu_volume is a
+      read-only property.
+- [x] Verified projection: shifting ee_pos by +30 mm in world Y moved the tool
+      centroid by exactly +121 px in detector Y (predicted 120 px = 30 × 2 / 0.5).
+      Confirms world→volume→detector geometry end-to-end.
+- [ ] Replace analytic ellipsoid + sphere abstraction with marching-cubes
+      meshes (real CT phantom, real Franka hand geometry) once we have the
+      source data.
 
-### Phase 5: Registration Pipeline 🔲
-- [ ] Implement gradient-based 2D/3D registration via fluorosim autodiff
-- [ ] Fix C-arm pose, optimize anatomy pose to match reference DRR
-- [ ] Recover T_robot_to_anatomy
-- [ ] Validate against Isaac Sim ground truth
-- [ ] Measure accuracy and convergence speed
+### Phase 5: Registration Pipeline 🚧 IN PROGRESS
+- [x] Translation-only phantom-pose registration via fluorosim Slang autodiff
+      (bridge/register_phantom.py); SlangDiffDRRRenderer + custom Adam over
+      translation only (rotation tensor frozen).
+- [x] Derived Docker image bridge/fluorosim_torch.Dockerfile (=fluorosim-torch)
+      adds PyTorch 2.5.1 + cu121 to the fluorosim base — fluorosim's torch
+      autograd path is optional and not in the base image.
+- [x] Synthetic-to-synthetic convergence verified: 19.7 mm initial error →
+      0.41 mm final error in 100 Adam iters (5.3 s on RTX 4060); loss
+      reduction 4.7e-2 → 1.6e-6 (29 000×). Per-axis err: x=0.04, y=0.02,
+      z=0.41 mm. Z error dominates because Z is the X-ray beam axis and
+      depth is poorly constrained by a single view (well-known single-view
+      depth ambiguity in 2D/3D registration).
+- [x] bridge/plot_registration.py renders convergence + image comparison plots.
+- [x] Registration against Isaac Sim ground truth: register_phantom.py reads
+      pose.json (phantom_pos / carm_pos), uses fluorosim translation =
+      (carm-phantom)*1000 as GT, optimizes, inverts back to world-frame
+      phantom_pos and reports error against Isaac Sim's value.
+      Trivial case (carm==phantom, GT translation=0): world-frame ||err|| = 0.41 mm.
+      Non-trivial (carm=phantom+30mm X, GT translation=(30,0,0)): ||err|| = 0.16 mm.
+      Both recover the Isaac Sim phantom_pos to sub-mm in world coordinates.
+- [x] Multi-view registration (AP + lateral, clinical sequential workflow).
+      bridge/register_phantom_multiview.py models the OR sequence: take AP shot,
+      rotate C-arm 90°, take lateral shot, register against both. Shared
+      translation parameter, summed MSE across views. Depth ambiguity is
+      collapsed: Z error went from 0.41 mm (single view) → 0.013 mm (8×
+      improvement on ||err||: 0.41 mm → 0.05 mm = ~50 μm vs Isaac Sim GT).
+      Z is now the BEST-constrained axis because BOTH views contribute to it.
+- [x] bridge/compute_robot_to_anatomy.py composes the multi-view registered
+      phantom_pos with the (Isaac-Sim-known) robot EE pose to produce T_R^A,
+      T_R^C, T_A^C in both ground-truth and recovered forms. Error in T_R^A
+      equals the registration's world_err (asserted internally) — 0.051 mm with
+      multi-view, 0.411 mm with single-view fallback. Includes a clinical
+      summary (EE position in anatomy frame; normalized-ellipsoid inside/outside
+      check vs bone core and soft tissue) and a 2D layout PNG showing EE in
+      anatomy frame.
+- [ ] 6-DOF (translation + rotation) registration — when this lands, plug the
+      recovered phantom rotation into compute_robot_to_anatomy.py's phantom_W_rec
 
 ### Phase 6: Neural Network Acceleration 🔲 (optional/future)
 - [ ] Generate training dataset: random poses → DRR pairs
@@ -298,6 +349,18 @@ needing a separate GUI session.
 | 2026-05-15 | Centroid test (carm == phantom)                 | ✅ Sphere centered at (256, 256) px in DRR   |
 | 2026-05-15 | Magnification test (+20mm X shift)              | ✅ Centroid at (176, 256.5) — exactly -80 px |
 | 2026-05-15 | verify_phantom.py + viewport snapshot           | ✅ Prims at expected world transform + visible |
+| 2026-05-15 | Phantom moved to (0.43, 0, 0.42) for EE overlap | ✅ EE rest pose now inside ±64 mm volume bounds |
+| 2026-05-15 | paint_tool_into_volume() in fluorosim_render    | ✅ Tool sphere (μ=0.5, r=15mm) burns into μ-volume |
+| 2026-05-15 | Tool-shift test (+30mm world Y)                 | ✅ Tool centroid moved +121 px in detector Y (vs 120 predicted) |
+| 2026-05-15 | bridge/fluorosim_torch.Dockerfile (=fluorosim-torch) | ✅ Adds PyTorch 2.5.1+cu121 on top of fluorosim |
+| 2026-05-15 | bridge/register_phantom.py — Phase 5 first cut  | ✅ Trans-only registration; 19.7 → 0.41 mm in 100 Adam iters |
+| 2026-05-15 | Discovered Slang autodiff returns FLIPPED grad sign | ⚠️ Workaround: negate translation.grad before optimizer.step() |
+| 2026-05-15 | bridge/plot_registration.py                     | ✅ Loss curve, per-axis error trace, target/recovered/diff plots |
+| 2026-05-15 | register_phantom.py reads pose.json as GT       | ✅ Recovers Isaac Sim phantom_pos to 0.41 mm in world frame |
+| 2026-05-15 | Non-trivial test: carm offset +30 mm X          | ✅ GT translation_mm=(30,0,0) recovered to (29.94, 0.03, 0.14) |
+| 2026-05-15 | bridge/register_phantom_multiview.py (AP+lat)   | ✅ Depth ambiguity collapsed: Z err 0.41→0.013 mm; ||err||=0.05 mm |
+| 2026-05-15 | bridge/compute_robot_to_anatomy.py              | ✅ T_R^A error = 0.051 mm; EE inside bone core (norm. dist 0.77) |
+| 2026-05-18 | End-to-end Isaac Sim scene test (Franka+phantom) | ✅ TCP-injected Franka USD + phantom prims into GUI; snapshot in docs/images/franka_phantom_scene.jpg shows both. Headless robot_scene.py wrote pose.json. Multi-view reg + compute_robot_to_anatomy.py recovered T_R^A to 0.051 mm on live scene data. |
 
 ---
 
@@ -364,6 +427,25 @@ Commands (in order):
 - Isaac Sim's print() output to stdout can be swallowed by its log redirection.
   Use sys.stdout.write(...) + sys.stdout.flush() if you need to capture script
   output in a pipe (e.g. `python.sh script.py | grep ...`).
+- fluorosim Slang autodiff returns gradients with FLIPPED sign relative to
+  PyTorch's convention. At trans=(15,0,0) with MSE loss against a target
+  rendered at (0,0,0), the analytical dL/dt_x came back as -0.002 while the
+  finite-difference reference is +0.003. Workaround in
+  bridge/register_phantom.py: `translation.grad.neg_()` between loss.backward()
+  and optimizer.step(). Without this, plain Adam DIVERGES (error grows from
+  20 mm to 110 mm over 100 iters).
+- Single-view 2D/3D registration cannot recover depth-axis translation
+  accurately — the volume just appears slightly larger/smaller. In our setup
+  the X-ray beam is along world Z, so the Z component of recovered translation
+  has ~10× the error of X/Y. Multi-view (orthogonal C-arm angles) or accepting
+  the depth uncertainty is the standard fix.
+- PreprocessedVolume.mu_volume is a read-only property. To inject a modified
+  volume (e.g. tool-painted) into a FluoroSimulator, construct a new
+  PreprocessedVolume(modified_mu, volume._metadata) rather than mutating.
+- PyTorch is NOT in the base fluorosim Docker image (it's listed as "optional"
+  in fluorosim's deps). The Phase 5 registration wrapper uses a derived
+  image `fluorosim-torch` built from bridge/fluorosim_torch.Dockerfile. Don't
+  expect `python -c "import torch"` to work inside the plain `fluorosim` image.
 
 ---
 
@@ -396,6 +478,30 @@ python3 ~/isaac_projects/scenes/isaacsim_client.py < ~/isaac_projects/scenes/ver
 # Visualize the rendered DRR + pose annotation
 python3 ~/isaac_projects/bridge/visualize_drr.py        # saves drr_annotated.png
 python3 ~/isaac_projects/bridge/visualize_drr.py --show # interactive window
+
+# Phase 5: run phantom translation registration (uses fluorosim-torch image)
+~/isaac_projects/bridge/run_register.sh
+# Override defaults via env vars (all optional):
+INIT_OFFSET_MM="30,0,0" LR_MM=2.0 N_ITERS=200 ~/isaac_projects/bridge/run_register.sh
+
+# Plot the registration convergence + image comparison (host-side)
+python3 ~/isaac_projects/bridge/plot_registration.py
+
+# Phase 5 (multi-view): clinical sequential AP + lateral C-arm shots
+~/isaac_projects/bridge/run_register_multiview.sh
+# Override which views: angles in degrees around Y (LAO/RAO axis)
+VIEWS_DEG_Y="0,45,90" ~/isaac_projects/bridge/run_register_multiview.sh
+# Plot multi-view results (host-side)
+python3 ~/isaac_projects/bridge/plot_registration_multiview.py
+
+# Phase 5 deliverable: compute T_robot_to_anatomy from registration + pose.json
+# (host-side, no Docker). Falls back to single-view if multi-view absent.
+python3 ~/isaac_projects/bridge/compute_robot_to_anatomy.py
+python3 ~/isaac_projects/bridge/compute_robot_to_anatomy.py --show  # interactive window
+
+# Build the derived torch-enabled image (one-time, ~5 min for the wheel download)
+docker build -t fluorosim-torch -f ~/isaac_projects/bridge/fluorosim_torch.Dockerfile \
+    ~/isaac_projects/bridge/
 
 # Install a package into Isaac Sim's kit Python (NOT pip install / conda)
 /home/max/isaacsim/kit/python/bin/python3 -m pip install <package> \

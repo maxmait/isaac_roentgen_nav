@@ -1,181 +1,304 @@
-# Fluoroscopy-Based Robot Pose Estimation in Isaac Sim
+# isaac_roentgen_nav
 
-Simulation pipeline that estimates a robot's pose relative to anatomy using
-simulated fluoroscopy (DRR) and 2D/3D CT registration — entirely in software.
+Fluoroscopy-guided robot pose estimation in Isaac Sim. A virtual surgical scene
+with a Franka arm and a CT phantom is imaged by a simulated mobile C-arm;
+differentiable DRR registration recovers the anatomy pose from the X-ray
+images; the recovered pose is composed with the robot's forward kinematics to
+produce **T_robot_in_anatomy** — the transform that intraoperative trajectory
+planning would consume.
 
-The longer-term goal: place a phantom, a robot, and a C-arm in a single scene,
-render an X-ray of the phantom + robot tool, and recover the spatial
-relationship between the robot and the anatomy by registering the rendered
-DRR against the CT volume. This relationship would then drive trajectory
-planning (e.g. "move closer to the spine").
+| Isaac Sim scene | Synthetic X-ray (DRR) | Robot EE in anatomy frame |
+|---|---|---|
+| ![Franka + phantom](docs/images/franka_phantom_scene.jpg) | ![DRR with tool](docs/images/drr_with_tool.png) | ![T_R^A layout](docs/images/robot_to_anatomy_layout.png) |
 
-| Phantom in Isaac Sim | DRR (C-arm at isocenter) | DRR (C-arm shifted +20 mm in X) |
-| --- | --- | --- |
-| ![phantom in isaac sim](docs/images/phantom_in_isaac.jpg) | ![centered DRR](docs/images/drr_centered.png) | ![shifted DRR](docs/images/drr_shifted_20mm.png) |
+**Current headline result** on the synthetic ellipsoid phantom: two sequential
+C-arm shots (AP + 90° lateral) recover the phantom position to **~0.05 mm**
+vs Isaac Sim ground truth, in ~10 s on an RTX 4060 Laptop.
 
-## Architecture
+---
+
+## Goal
+
+The final deliverable is the spatial transform between the robot end-effector
+and the patient anatomy — established entirely through simulated fluoroscopy.
+Once this transform is known, the surgeon (or a planner) can:
+
+- Know whether the tool tip is inside or outside the bone core
+- Plan a trajectory toward a surgical target ("move 5 mm closer to the spine")
+- Track tool drift relative to anatomy across multiple imaging instants
+
+Everything runs in simulation for now; the design is structured so that each
+component (Isaac Sim → pose.json → fluorosim → registration → transform
+composition) maps directly to its real-OR counterpart.
+
+---
+
+## Pipeline
 
 ```
-Isaac Sim (host)           pose.json           fluorosim (Docker)
-┌───────────────────┐      ─────────►     ┌───────────────────────┐
-│ Franka + phantom  │                     │ Differentiable DRR    │
-│ writes EE pose,   │   ◄─────────        │ from synthetic μ-vol  │
-│ phantom pose,     │     drr.png         │ via Slang autodiff    │
-│ C-arm pose        │     drr_meta.json   │ (Beer-Lambert)        │
-└───────────────────┘                     └───────────────────────┘
-        ▲                                            ▲
-        │  TCP :8226 (Claude Code / VSCode ext)     │
-        │  ZMQ :5556 (viewport JPEG stream)         │
-        ▼                                            │
-   verify_pose.py                                    │
-   verify_phantom.py             visualize_drr.py ◄──┘
+   ┌──────────────────────────────────────────────┐
+   │  Isaac Sim  (host, headless)                  │
+   │                                              │
+   │  Franka arm ─── FK ──► ee_pos, ee_quat       │
+   │  Phantom    ─── USD ──► phantom_pos           │
+   │  C-arm      ─── set ──► carm_pos              │
+   │                                              │
+   │  → pose.json  (written each sim step)         │
+   └──────────────────┬───────────────────────────┘
+                      │
+                      ▼
+   ┌──────────────────────────────────────────────┐
+   │  fluorosim  (Docker, GPU)                    │
+   │                                              │
+   │  ➊  Paint robot tool into μ-volume           │
+   │  ➋  Render AP DRR  (C-arm rotation = 0°)     │
+   │  ➌  Rotate gantry 90°                        │
+   │  ➍  Render lateral DRR                       │
+   │  ➎  Multi-view registration                  │
+   │       single shared translation parameter    │
+   │       summed MSE + Slang autodiff + Adam      │
+   │  → recovered phantom_pos (world frame)        │
+   └──────────────────┬───────────────────────────┘
+                      │
+                      ▼
+   ┌──────────────────────────────────────────────┐
+   │  Post-processing  (host, pure Python)        │
+   │                                              │
+   │  T_R^W  ← ee_pos / ee_quat  (FK, always known) │
+   │  T_C^W  ← carm_pos / quat   (calibration)    │
+   │  T_A^W  ← registered phantom_pos             │
+   │                                              │
+   │  T_R^A = inv(T_A^W) · T_R^W                   │
+   │  T_R^C, T_A^C   (all three transforms)       │
+   │  Clinical: EE inside/outside bone core?      │
+   └──────────────────────────────────────────────┘
 ```
 
-`pose.json` is the contract between the two processes. It contains the
-end-effector pose, the phantom isocenter pose, and the C-arm pose — all in
-the Isaac Sim world frame. The fluorosim side applies a world→isocenter
-transform (`translation_mm = (carm_pos - phantom_pos) * 1000`) before feeding
-the result into the differentiable renderer.
+`pose.json` carries every world-frame pose (EE, C-arm, phantom) as the IPC
+contract between Isaac Sim and the fluorosim container. The registration
+recovers `translation_mm = (carm_pos − phantom_pos) × 1000`, which is the
+C-arm position in the volume-local frame — the real unknown in any
+fluoroscopy-guided procedure.
 
-## Hardware Used for Development
+---
+
+## Clinical faithfulness
+
+> *Are we feeding the registration information that a real OR wouldn't have
+> — especially the phantom isocenter pose?*
+
+**Short answer: no.** The `phantom_pos` field in `pose.json` is used in
+two roles that are easy to conflate but are distinct:
+
+| Use of `phantom_pos` | Role | Real-life analog |
+|---|---|---|
+| fluorosim renders target DRRs at this pose | Where the anatomy sits in the simulated world | The physical patient — no "knowledge" required, the X-ray hits it regardless |
+| `compute_robot_to_anatomy.py` compares GT vs recovered | Accuracy scoring | An independent precision measurement (optical tracker, CMM) — present only for evaluation |
+
+The optimizer never reads `phantom_pos`. It sees only the CT μ-volume, the
+two target images, and an initial translation guess. Convergence to 50 µm is
+recovery from the images alone.
+
+Full input audit:
+
+| Input | Sim source | Real-OR source | Realistic? |
+|---|---|---|---|
+| Robot EE pose | Isaac Sim FK | Joint encoders → FK | ✓ |
+| C-arm pose | Set in `pose.json` | Hand-eye calibration C-arm ↔ robot (one-time) | ✓ |
+| C-arm gantry angle per shot | Hardcoded 0° / 90° | Gantry encoders | ✓ |
+| CT μ-volume | Synthetic cache | Pre-op CT, segmented HU→μ | ✓ (mechanism identical) |
+| Target X-ray | Rendered by fluorosim | Actual X-ray photons | ✓ (same Beer–Lambert physics) |
+| Optimizer initial guess | `gt + INIT_OFFSET_MM` | Planning prior or "anatomy at isocenter" | ⚠ uses GT as basis for testing; easily replaced with a fixed prior |
+| Ground-truth phantom pose (for scoring) | `pose.json` | Sim-only — NOT used by the optimizer | Validation reference only |
+
+One note on coordinate frames: Isaac Sim uses an arbitrary world frame, but
+the Franka sits at the origin, so world ≡ robot-base here. In a real OR
+everything would be expressed in robot-base frame using the same math.
+
+---
+
+## Hardware
 
 - NVIDIA RTX 4060 Laptop (8 GB VRAM, CC 8.9), AMD Ryzen 7 7840HS, 32 GB RAM
-- Ubuntu 22.04 LTS, NVIDIA Driver 590.48.01, CUDA 13.1 (driver) / 12.6 (container)
+- Ubuntu 22.04, NVIDIA Driver 590.48, CUDA 13.1 host / 12.6 container
 
-The pipeline runs comfortably on this hardware. Larger CT volumes (>256³) may
-exceed 8 GB VRAM; the synthetic phantom used here is 128×256×256.
+## Software stack
 
-## Software Stack
+- **Isaac Sim 4.5.0** (standalone at `~/isaacsim/`)
+- **fluorosim** (NVIDIA i4h-sensor-simulation) in its own Docker image
+- **fluorosim-torch** — derived image (`bridge/fluorosim_torch.Dockerfile`)
+  adding PyTorch for the differentiable registration
+- Host-side Python: `numpy`, `matplotlib`, `pyzmq`, `Pillow` — see
+  [`pyproject.toml`](pyproject.toml)
 
-- **Isaac Sim 4.5.0** (standalone install at `~/isaacsim/`)
-- **Docker + NVIDIA Container Toolkit** for fluorosim
-- **fluorosim** (NVIDIA `i4h-sensor-simulation`) — runs inside its own Docker
-  image, isolated from Isaac Sim. Kept outside this repo at
-  `~/nvidia-third-party/i4h-sensor-simulation/`.
-
-Host-side Python dependencies are intentionally minimal — see
-[`pyproject.toml`](pyproject.toml). The heavy lifting happens inside Isaac
-Sim's embedded Python and inside the fluorosim Docker image.
+---
 
 ## Installation
 
 ```bash
-# 1. Install Isaac Sim 4.5.0 standalone -> ~/isaacsim/   (see NVIDIA docs)
+# 1. Install Isaac Sim 4.5.0 standalone (per NVIDIA docs)
 
-# 2. Clone & build fluorosim outside this repo
-mkdir -p ~/nvidia-third-party
-cd ~/nvidia-third-party
+# 2. Build fluorosim base image (outside this repo)
+mkdir -p ~/nvidia-third-party && cd ~/nvidia-third-party
 git clone https://github.com/isaac-for-healthcare/i4h-sensor-simulation.git
-cd i4h-sensor-simulation/fluoro-simulator
-docker build -t fluorosim .
+cd i4h-sensor-simulation/fluoro-simulator && docker build -t fluorosim .
 
-# 3. Install pyzmq into Isaac Sim's embedded Python (NOT into your conda env)
+# 3. Build the torch-enabled derivative (~5 min, one-time)
+docker build -t fluorosim-torch \
+    -f ~/isaac_projects/bridge/fluorosim_torch.Dockerfile \
+    ~/isaac_projects/bridge/
+
+# 4. Install pyzmq into Isaac Sim's embedded Python (not your conda env)
 /home/$USER/isaacsim/kit/python/bin/python3 -m pip install pyzmq \
     --target /home/$USER/isaacsim/kit/python/lib/python3.10/site-packages
 
-# 4. Host-side glue dependencies
+# 5. Host-side glue
 pip install -e .
 ```
 
-## Quick Start
+---
 
-End-to-end run (Isaac Sim is headless; fluorosim runs in Docker). All
-commands assume your CWD is the project root and that conda is **not**
-active — Isaac Sim's embedded Python clashes with conda's site-packages.
+## Quick start — full end-to-end
 
 ```bash
-conda deactivate              # if you're in a conda env
-cd ~/isaac_projects           # repo root
+conda deactivate   # Isaac Sim clashes with conda's site-packages
+cd ~/isaac_projects
 
-# 1. Write a pose.json from the simulated Franka + phantom scene.
-#    Takes ~25-30s; most of it is Isaac Sim asset loading.
+# Step 1 — build the simulated scene and write pose.json (~25 s)
 ~/isaacsim/python.sh scenes/robot_scene.py
 
-# 2. Render a DRR from that pose. run_fluorosim.sh is a HOST-side wrapper
-#    that runs `docker run --gpus all fluorosim ...` internally — do NOT
-#    enter the container yourself first.
-bridge/run_fluorosim.sh
+# Step 2 — sequential AP + lateral registration (~10 s)
+bridge/run_register_multiview.sh
 
-# 3. Annotate the DRR and run a flat-image sanity check.
-python3 bridge/visualize_drr.py
+# Step 3 — compose T_robot_in_anatomy from registration + FK
+python3 bridge/compute_robot_to_anatomy.py
 ```
 
-Outputs land in `output/` (gitignored):
-- `pose.json` — written by Isaac Sim each simulation step
-- `drr.png`, `drr.npy`, `drr_meta.json` — written by fluorosim
-- `drr_annotated.png` — DRR with pose overlay
-- `fluorosim_cache/` — preprocessed μ-volume cache (persists across runs)
+`compute_robot_to_anatomy.py` prints the headline result and writes
+`output/robot_to_anatomy.json` + `output/robot_to_anatomy_layout.png`.
 
-### Live introspection (Claude Code / VSCode extension)
-
-A running Isaac Sim GUI exposes a TCP code-injection socket at `127.0.0.1:8226`
-(set by the bundled `isaacsim.code_editor.vscode` extension). Two thin helpers
-use this to read live state:
+### Optional: render and inspect the DRR
 
 ```bash
-python3 scenes/isaacsim_client.py < scenes/verify_pose.py     # live EE pose vs pose.json
-python3 scenes/isaacsim_client.py < scenes/verify_phantom.py  # phantom prim world transforms
+bridge/run_fluorosim.sh          # renders DRR with tool painted in
+python3 bridge/visualize_drr.py  # annotated PNG + sanity check
 ```
 
-A second injection-based helper streams viewport frames as JPEG over ZMQ
-(`tcp://127.0.0.1:5556`) for headless snapshots:
+### Optional: single-view baseline (for comparison)
 
 ```bash
-python3 scenes/isaacsim_client.py "$(cat scenes/image_publisher.py)"  # start the stream
-python3 scenes/take_snapshot.py snapshot.jpg                          # grab one frame
+bridge/run_register.sh           # AP only → ~0.4 mm (depth ambiguity present)
+python3 bridge/plot_registration.py
 ```
 
-## Project Layout
+### Live introspection via Isaac Sim TCP
+
+```bash
+# Verify EE pose and phantom prims in a running GUI session
+python3 scenes/isaacsim_client.py < scenes/verify_pose.py
+python3 scenes/isaacsim_client.py < scenes/verify_phantom.py
+
+# Capture a viewport snapshot
+python3 scenes/isaacsim_client.py "$(cat scenes/image_publisher.py)"
+python3 scenes/take_snapshot.py my_snapshot.jpg
+```
+
+---
+
+## Results
+
+### Multi-view vs single-view
+
+A single AP shot cannot resolve translation along the X-ray beam axis (depth
+ambiguity). The 90° lateral shot collapses it:
+
+| Method | x err | y err | **z err** | ‖err‖ |
+|---|---|---|---|---|
+| Single view (AP only) | 0.04 mm | 0.02 mm | **0.41 mm** | 0.41 mm |
+| **AP + Lateral (sequential)** | 0.04 mm | −0.03 mm | **0.01 mm** | **0.05 mm** |
+
+Z is the *most-constrained* axis with two views because it is in-plane in the
+lateral view and its gradient is strong there.
+
+![Registration convergence](docs/images/registration_multiview_convergence.png)
+
+### End-to-end result on a real Isaac Sim scene
+
+```
+T_robot_in_anatomy.t  (mm)
+         Ground truth:  [  0.623,  15.397,  -2.932 ]
+            Recovered:  [  0.659,  15.363,  -2.919 ]
+     Per-axis error:    [  0.036,  -0.033,   0.013 ]
+         ‖error‖:       0.051 mm
+
+Clinical: Tool tip is INSIDE the bone core (normalized distance 0.77).
+```
+
+---
+
+## Project layout
 
 ```
 isaac_roentgen_nav/
-├── scenes/                     # Isaac Sim (host-side, USD scenes & tooling)
-│   ├── robot_scene.py          # headless scene: Franka + phantom, writes pose.json
-│   ├── phantom.py              # shared phantom geometry (single source of truth)
-│   ├── verify_pose.py          # TCP-injected: compare live EE pose to pose.json
-│   ├── verify_phantom.py       # TCP-injected: check phantom prim world transform
-│   ├── isaacsim_client.py      # TCP client for the VSCode extension socket
-│   ├── image_publisher.py      # injected: ZMQ viewport JPEG stream
-│   └── take_snapshot.py        # SUB-side: save one frame from the stream
-├── bridge/                     # fluorosim side (runs inside Docker / wraps it)
-│   ├── fluorosim_render.py     # reads pose.json, renders DRR
-│   ├── run_fluorosim.sh        # docker run wrapper with the right bind mounts
-│   └── visualize_drr.py        # annotated viewer + sanity check
-├── docs/images/                # reference screenshots used in README
-├── output/                     # runtime artifacts (gitignored)
-├── CLAUDE.md                   # implementation notes, gotchas, full state log
-├── pyproject.toml              # host-side Python metadata
-├── LICENSE                     # Apache-2.0
-└── README.md                   # you are here
+├── scenes/                            # Isaac Sim — scene scripts + host tooling
+│   ├── robot_scene.py                 # headless: Franka + phantom, writes pose.json
+│   ├── phantom.py                     # shared phantom geometry (single source of truth)
+│   ├── verify_pose.py                 # TCP-injected: EE pose vs pose.json
+│   ├── verify_phantom.py              # TCP-injected: phantom prim world transform
+│   ├── isaacsim_client.py             # TCP client for VSCode extension socket
+│   ├── image_publisher.py             # TCP-injected: ZMQ JPEG viewport stream
+│   └── take_snapshot.py               # ZMQ subscriber: save one frame
+├── bridge/                            # fluorosim side + post-processing
+│   ├── fluorosim_render.py            # in-container: pose.json → DRR (tool painted)
+│   ├── run_fluorosim.sh               # docker run wrapper
+│   ├── visualize_drr.py               # host: annotated viewer + sanity check
+│   ├── fluorosim_torch.Dockerfile     # fluorosim + PyTorch 2.5.1+cu121
+│   ├── register_phantom.py            # single-view translation registration
+│   ├── run_register.sh                # wrapper for single-view
+│   ├── plot_registration.py           # host: single-view convergence plots
+│   ├── register_phantom_multiview.py  # sequential AP + lateral registration
+│   ├── run_register_multiview.sh      # wrapper for multi-view
+│   ├── plot_registration_multiview.py # host: per-view losses + image grid
+│   └── compute_robot_to_anatomy.py    # host: registration → T_R^A, T_R^C, T_A^C
+├── docs/images/                       # committed reference images for this README
+├── output/                            # runtime artifacts — gitignored
+├── CLAUDE.md                          # detailed implementation log, gotchas
+├── pyproject.toml
+├── LICENSE                            # Apache-2.0
+└── README.md
 ```
+
+---
 
 ## Status
 
-Implemented:
+**Done:**
 
-- **Phase 1** — Isaac Sim scene with Franka, EE pose readable headless
-- **Phase 2** — fluorosim Docker image, differentiable DRR rendering at ~155 FPS
-- **Phase 2.5** — Claude Code ↔ Isaac Sim TCP/ZMQ tooling (code injection +
-  viewport snapshots)
-- **Phase 3** — Pose-file IPC: Isaac Sim writes `pose.json`, fluorosim renders
-  a DRR from it
-- **Phase 4 (in progress)** — Synthetic ellipsoid phantom in Isaac Sim,
-  world↔isocenter transform verified (centered DRR at isocenter; +20 mm X
-  shift produces exactly the expected −80 px detector offset)
+- **Phase 1** — Isaac Sim headless scene; Franka EE pose readable
+- **Phase 2** — fluorosim Docker; differentiable DRR at ~150 FPS
+- **Phase 2.5** — TCP code-injection + ZMQ viewport snapshot tooling
+- **Phase 3** — `pose.json` IPC; full Isaac Sim → fluorosim → DRR loop
+- **Phase 4** — Shared phantom geometry; world↔isocenter transform verified
+  numerically; robot tool painted into μ-volume and visible in DRR
+- **Phase 5** — Translation-only registration; single-view (0.41 mm) and
+  multi-view (0.05 mm); `compute_robot_to_anatomy.py` produces T_R^A;
+  end-to-end test on a live Isaac Sim scene
 
-Next:
+**Next:**
 
-- Make the Franka tool contribute to attenuation (visible in DRR)
-- Replace analytic ellipsoid with a marching-cubes mesh from a real CT phantom
-- 2D/3D registration via fluorosim's Slang autodiff (Phase 5)
+- **6-DOF registration** — extend to translation + rotation (phantom
+  orientation is currently assumed identity)
+- **Real CT phantom** — replace the synthetic ellipsoid with a segmented
+  DICOM volume (marching-cubes mesh for Isaac Sim + μ-volume for fluorosim)
+- **Trajectory planning** — consume T_R^A to drive the Franka toward a
+  surgical target while maintaining the tool tip inside a safety region
 
-See [`CLAUDE.md`](CLAUDE.md) for the detailed implementation history, design
-decisions, and the running list of gotchas.
+---
 
 ## Acknowledgments
 
-- [NVIDIA Isaac for Healthcare (i4h) — Sensor Simulation](https://github.com/isaac-for-healthcare/i4h-sensor-simulation)
-  — provides the fluorosim differentiable DRR renderer used in this pipeline.
+- [NVIDIA i4h — Sensor Simulation](https://github.com/isaac-for-healthcare/i4h-sensor-simulation) — fluorosim differentiable DRR renderer
+- NVIDIA Isaac Sim 4.5.0 — physics simulation, USD, Franka asset
 
 ## License
 
