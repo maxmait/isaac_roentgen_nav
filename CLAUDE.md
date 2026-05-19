@@ -332,16 +332,30 @@ needing a separate GUI session.
            already-inverted [0,1] images. Fixed: undo invert, apply
            log1p(x×50), p2–p98 clip in plot_registration_multiview.py.
            Display is completely decoupled from the registration optimizer.
-- [ ] Update scenes/phantom.py constants (PHANTOM_POS_WORLD_M, semiaxes / mesh
-      path) to match the real-CT geometry so compute_robot_to_anatomy.py and
-      USE_POSE_JSON=1 registration work against the CT phantom. Today the CT
-      runs must use USE_POSE_JSON=0 because pose.json still encodes the
-      synthetic ellipsoid placement.
-- [ ] Build a matching Isaac Sim mesh from the CT — marching cubes on the
-      thresholded volume (skimage.measure.marching_cubes) → USD mesh prim at
-      /World/Phantom — to replace the analytic ellipsoid in robot_scene.py.
+- [x] Phase 5e — Isaac Sim CT mesh.  bridge/ct_to_mesh.py runs marching cubes
+      on the cached μ-volume (skimage), applies Laplacian smoothing, and saves
+      output/spine_mesh.{obj,verts.npy,faces.npy,json}.  scenes/robot_scene.py
+      loads the .npy mesh into a UsdGeom.Mesh at /World/Phantom/Mesh; the
+      synthetic ellipsoid is the fallback when the mesh is missing.  Verified
+      visually via TCP injection: 238k verts / 473k faces, anatomically
+      recognisable vertebral column with rib heads.  Mesh isocenter aligned
+      with PHANTOM_POS_WORLD_M=(0.43,0,0.42) m, same as the synthetic phantom.
+- [x] Phase 5f — close the USE_POSE_JSON=1 loop on the CT.  The CT mesh's
+      isocenter in robot_scene.py is at PHANTOM_POS_WORLD_M, so pose.json
+      ground-truth applies to both phantom types.  compute_robot_to_anatomy.py
+      now does a data-driven inside-bone/soft-tissue check by μ-volume
+      lookup at the EE position in anatomy frame (replaces the analytic
+      ellipsoid distance check when a CT cache exists), and the layout PNG
+      shows axial+coronal μ-slices through the isocenter with the EE marker
+      overlaid.  End-to-end test on the spine CT: world ||err|| = 0.096 mm;
+      EE at (0.72, 15.39, -2.91) mm in anatomy frame, local μ=0.0225 mm⁻¹
+      → tool tip in soft tissue, anatomically consistent with a position
+      just anterior to the vertebral body.
 - [ ] 6-DOF (translation + rotation) registration — when this lands, plug the
       recovered phantom rotation into compute_robot_to_anatomy.py's phantom_W_rec
+- [ ] Surgical scene environment — operating table USD asset, robot platform
+      next to the table, the CT phantom on the table.  Cosmetic only — the
+      pipeline math is already closed.
 
 ### Phase 6: Neural Network Acceleration 🔲 (optional/future)
 - [ ] Generate training dataset: random poses → DRR pairs
@@ -406,6 +420,9 @@ needing a separate GUI session.
 | 2026-05-19 | CT_CROP_CENTER_ZYX env var + manual --center CLI flag    | ✅ Allows per-CT override: CT_CROP_CENTER_ZYX="z,y,x" voxel indices in full CT. Propagated through run_load_ct.sh, run_register*.sh |
 | 2026-05-19 | Bug: DRR display overexposed in images.png              | ❌ gamma=0.5 on already-inverted [0,1] images brightened mid-tones (soft tissue→white). Fixed: undo invert, log1p(x×50), p2–p98 clip. Display decoupled from registration. |
 | 2026-05-19 | Registration with auto-detected vertebral centre        | ✅ Real spine CT cropped at z=568 (upper lumbar); AP + lateral DRRs show vertebral bodies, rib heads, disc spaces. 25 mm → 0.096 mm in 100 iters (8.2 s) |
+| 2026-05-19 | Phase 5e: bridge/ct_to_mesh.py + USD UsdGeom.Mesh in robot_scene.py | ✅ Marching cubes on cached μ-volume → 238k verts / 473k faces OBJ + numpy sidecars. robot_scene.py loads mesh into /World/Phantom/Mesh; falls back to ellipsoid if absent. Verified visually via TCP injection (snapshots/ct_mesh_only.jpg) |
+| 2026-05-19 | Phase 5f: USE_POSE_JSON=1 closure on the CT             | ✅ Mesh isocenter at PHANTOM_POS_WORLD_M = synthetic isocenter, so same pose.json contract applies. End-to-end test: 0.096 mm world err on CT phantom. EE at (0.72, 15.4, -2.9) mm in anatomy frame, local μ=0.0225 → soft tissue (correct anatomically) |
+| 2026-05-19 | compute_robot_to_anatomy.py: data-driven inside/outside check | ✅ μ-volume lookup replaces ellipsoid distance check when CT cache exists. Layout PNG now shows axial+coronal CT slices through isocenter (replaces ellipse drawings). Ellipsoid fallback preserved for synthetic phantom |
 
 ---
 
@@ -513,11 +530,19 @@ Commands (in order):
   The skin-to-skin spine CT has its center in the head/neck (z=398 of 797).
   Confirmed by rendering 3 orthogonal DRRs: head anatomy visible, no spine.
   Always verify with a sagittal/axial slice plot of the μ-volume after first load.
-- CT runs must currently set USE_POSE_JSON=0. The live pose.json still encodes
-  the synthetic ellipsoid placement (PHANTOM_POS_WORLD_M=(0.43,0,0.42)), so the
-  world-frame ground-truth report is meaningless for real-CT runs until
-  phantom.py and robot_scene.py are updated to use the CT mesh. The
-  fluorosim-translation-space error is unaffected.
+- USE_POSE_JSON=1 now works with the real CT cache (Phase 5f).  The CT
+  mesh's isocenter is placed at PHANTOM_POS_WORLD_M=(0.43,0,0.42) m in
+  robot_scene.py — same as the synthetic phantom — so the world-frame
+  ground-truth report is meaningful for both phantom types.  No need to
+  set USE_POSE_JSON=0 unless you specifically want to disable the
+  pose.json ground-truth comparison for debugging.
+- The "Tool tip inside bone/soft tissue" clinical check in
+  compute_robot_to_anatomy.py is data-driven when a CT cache exists:
+  it looks up the local μ value at the EE position in anatomy frame
+  and classifies by μ thresholds (bone > 0.035, soft tissue > 0.012).
+  Falls back to the analytic ellipsoid distance check only when there's
+  no CT cache.  The mu_volume.npy is mmapped so the lookup is essentially
+  free (one voxel read).
 - VolumePreprocessor HU→μ LUT clamps at μ_water (0.020 mm⁻¹) — bone gets
   zero extra attenuation over soft tissue and is invisible in DRRs. ct_loader.py
   calls VolumePreprocessor only for metadata, then immediately overwrites

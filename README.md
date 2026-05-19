@@ -322,17 +322,24 @@ isaac_roentgen_nav/
 - **Phase 5d** — Real DICOM CT integration: `bridge/ct_loader.py` loads a
   797-slice spine CT via SimpleITK; `DICOM_PATH` + `CT_FULL_VOLUME` env vars
   select real CT vs synthetic and cropped vs full volume. Multi-view
-  registration on the real CT converges to **0.037 mm** (cropped ROI) and
-  **0.085 mm** (full 797×512×512 scan), both within 8 GB VRAM
+  registration on the real CT converges to **~0.1 mm** ‖err‖ in both modes,
+  within 8 GB VRAM
+- **Phase 5e** — Isaac Sim CT mesh: `bridge/ct_to_mesh.py` extracts a
+  triangle mesh from the cached μ-volume (marching cubes + Laplacian
+  smoothing), `scenes/robot_scene.py` loads it as a `UsdGeom.Mesh` —
+  ellipsoid fallback when the mesh is absent
+- **Phase 5f** — Closed `USE_POSE_JSON=1` loop on the CT phantom.
+  `compute_robot_to_anatomy.py` now does data-driven inside-bone/soft-tissue
+  classification via μ-volume lookup at the EE position; the layout PNG
+  shows actual axial+coronal CT slices through the isocenter
 
 **Next:**
 
-- **Isaac Sim CT mesh** — build a USD mesh from the CT (marching cubes on
-  the segmented volume) to replace the analytic ellipsoid in `robot_scene.py`;
-  update `scenes/phantom.py` constants so `compute_robot_to_anatomy.py` works
-  end-to-end against the real CT phantom
 - **6-DOF registration** — extend to translation + rotation (phantom
   orientation currently assumed identity)
+- **Surgical scene** — operating table, robot platform, lights, C-arm
+  model around the existing Franka + CT phantom setup (cosmetic only;
+  the math is already closed)
 - **Trajectory planning** — consume T_R^A to drive the Franka toward a
   surgical target while maintaining the tool tip inside a safety region
 
