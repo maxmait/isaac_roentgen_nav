@@ -241,6 +241,7 @@ Z is the *most-constrained* axis with two views because it is in-plane in the
 lateral view and its gradient is strong there.
 
 ![Registration convergence](docs/images/registration_multiview_convergence.png)
+![Registration Multiview](docs/images/registration_multiview_image.png)
 
 ### Real CT results
 
