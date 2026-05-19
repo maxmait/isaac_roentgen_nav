@@ -59,6 +59,9 @@ using simulated fluoroscopy (DRR) and 2D/3D CT registration — entirely in soft
     plot_registration_multiview.py # host-side: per-view losses + per-view target/recovered/diff panels
     compute_robot_to_anatomy.py    # Phase 5 deliverable: composes registered phantom with EE pose
                                    # → T_R^A, T_R^C, T_A^C + clinical inside/outside check
+    ct_loader.py                   # Phase 5d: DICOM CT → PreprocessedVolume (cropped ROI or full)
+    run_load_ct.sh                 # docker wrapper to pre-warm the CT cache (one-time)
+                                   # CT_FULL_VOLUME=1 → full 797×512×512 native-spacing volume
   docs/images/                     # screenshots committed to the repo (README assets)
   output/                          # runtime artifacts: pose.json, drr.*, fluorosim_cache/ (gitignored)
 
@@ -307,6 +310,36 @@ needing a separate GUI session.
       summary (EE position in anatomy frame; normalized-ellipsoid inside/outside
       check vs bone core and soft tissue) and a 2D layout PNG showing EE in
       anatomy frame.
+- [x] Phase 5d — real CT integration on the registration side (no Isaac Sim yet).
+      bridge/ct_loader.py loads a DICOM series via SimpleITK. Two modes:
+        Cropped (default): auto-detect vertebral body level, crop 128 mm³ ROI,
+          resample to (128,256,256) @ (1,0.5,0.5) mm → fluorosim_cache_ct/.
+          0.096 mm error, 8.2 s (82 ms/iter) on the spine CT.
+        Full volume (CT_FULL_VOLUME=1): entire scan at native anisotropic spacing
+          — (797,512,512) @ (0.5,0.703,0.703) mm = 836 MB, ~1.7 GB VRAM — fits
+          in 8 GB; cache at fluorosim_cache_ct_full/; 0.076 mm, 158 ms/iter.
+      Both caches coexist; DICOM_PATH + CT_FULL_VOLUME + CT_CROP_CENTER_ZYX
+      flags select the path. Synthetic path unchanged (no DICOM_PATH).
+      Key fixes made during 2026-05-19 development (see State Log):
+        1. VolumePreprocessor HU→μ LUT clamped at μ_water — bone invisible.
+           Fixed with bilinear hu_to_mu() in ct_loader.py; μ now reaches
+           0.065 mm⁻¹ for cortical bone vs water at 0.020.
+        2. Default crop center was geometric volume center — landed in the
+           head/neck for the skin-to-skin spine CT, not the spine.  Fixed
+           with find_vertebral_center() auto-detection (compact-bone heuristic)
+           + CT_CROP_CENTER_ZYX env var for manual override.
+        3. DRR display "overexposed" — gamma=0.5 brightened mid-tones on
+           already-inverted [0,1] images. Fixed: undo invert, apply
+           log1p(x×50), p2–p98 clip in plot_registration_multiview.py.
+           Display is completely decoupled from the registration optimizer.
+- [ ] Update scenes/phantom.py constants (PHANTOM_POS_WORLD_M, semiaxes / mesh
+      path) to match the real-CT geometry so compute_robot_to_anatomy.py and
+      USE_POSE_JSON=1 registration work against the CT phantom. Today the CT
+      runs must use USE_POSE_JSON=0 because pose.json still encodes the
+      synthetic ellipsoid placement.
+- [ ] Build a matching Isaac Sim mesh from the CT — marching cubes on the
+      thresholded volume (skimage.measure.marching_cubes) → USD mesh prim at
+      /World/Phantom — to replace the analytic ellipsoid in robot_scene.py.
 - [ ] 6-DOF (translation + rotation) registration — when this lands, plug the
       recovered phantom rotation into compute_robot_to_anatomy.py's phantom_W_rec
 
@@ -361,6 +394,18 @@ needing a separate GUI session.
 | 2026-05-15 | bridge/register_phantom_multiview.py (AP+lat)   | ✅ Depth ambiguity collapsed: Z err 0.41→0.013 mm; ||err||=0.05 mm |
 | 2026-05-15 | bridge/compute_robot_to_anatomy.py              | ✅ T_R^A error = 0.051 mm; EE inside bone core (norm. dist 0.77) |
 | 2026-05-18 | End-to-end Isaac Sim scene test (Franka+phantom) | ✅ TCP-injected Franka USD + phantom prims into GUI; snapshot in docs/images/franka_phantom_scene.jpg shows both. Headless robot_scene.py wrote pose.json. Multi-view reg + compute_robot_to_anatomy.py recovered T_R^A to 0.051 mm on live scene data. |
+| 2026-05-18 | bridge/ct_loader.py + run_load_ct.sh (DICOM → cache)  | ✅ 797-slice spine CT (512² @ 0.5×0.7×0.7 mm) → SimpleITK → cropped 128 mm³ ROI, resampled to (128,256,256) @ (1,0.5,0.5) mm; cached at output/fluorosim_cache_ct/ |
+| 2026-05-18 | register_phantom*.py: DICOM_PATH env switch           | ✅ Single flag selects real CT vs synthetic; wrappers conditionally mount DICOM dir + ct_loader.py at /workspace |
+| 2026-05-18 | Multi-view registration on real spine CT              | ✅ 25 mm → 0.037 mm in 100 iters (9.4 s); per-axis (0.029, -0.008, 0.021) mm — beats 0.2 mm target; anatomy clearly visible in target/recovered DRRs |
+| 2026-05-18 | Synthetic regression after DICOM_PATH plumbing        | ✅ 25 mm → 0.080 mm; no regression vs historical 0.05 mm baseline |
+| 2026-05-19 | ct_loader.py: CT_FULL_VOLUME=1 mode (no crop/resample) | ✅ Full (797,512,512) @ (0.5,0.703,0.703) mm, 836 MB; 0.085 mm error, 156 ms/iter; fits 8 GB VRAM with room to spare |
+| 2026-05-19 | Bug: VolumePreprocessor HU→μ LUT clamps at μ_water     | ❌ Bone had zero extra attenuation over water; DRRs were gray clouds with no bone visible. Fixed: bilinear hu_to_mu() in ct_loader.py bypasses VolumePreprocessor μ output; μ_bone now 0.048 mm⁻¹ |
+| 2026-05-19 | Three-axis DRR survey (rx=0/90, ry=0/90, rz=0)         | ✅ Confirmed: ry=0° projects along CT Z axis (head→feet = coronal); rx=90° = true AP spine fluoroscopy view (ant→post); ry=90° = lateral (left→right) |
+| 2026-05-19 | Bug: default crop center in head/neck (wrong anatomy)   | ❌ Geometric volume center (z=398) of the skin-to-skin CT is at mid-neck. Confirmed by rendering 3 orthogonal DRRs: head anatomy visible, no spine. |
+| 2026-05-19 | find_vertebral_center() auto-detection in ct_loader.py  | ✅ Compact-bone heuristic: counts bone voxels in central X-Y window per axial slice, finds Y centroid of vertebral body. Auto-detected z=568 (upper lumbar) for spine CT. |
+| 2026-05-19 | CT_CROP_CENTER_ZYX env var + manual --center CLI flag    | ✅ Allows per-CT override: CT_CROP_CENTER_ZYX="z,y,x" voxel indices in full CT. Propagated through run_load_ct.sh, run_register*.sh |
+| 2026-05-19 | Bug: DRR display overexposed in images.png              | ❌ gamma=0.5 on already-inverted [0,1] images brightened mid-tones (soft tissue→white). Fixed: undo invert, log1p(x×50), p2–p98 clip. Display decoupled from registration. |
+| 2026-05-19 | Registration with auto-detected vertebral centre        | ✅ Real spine CT cropped at z=568 (upper lumbar); AP + lateral DRRs show vertebral bodies, rib heads, disc spaces. 25 mm → 0.096 mm in 100 iters (8.2 s) |
 
 ---
 
@@ -389,7 +434,11 @@ Commands (in order):
   assets are loading. Always use --headless to avoid confusion.
 - Force-quitting the Isaac Sim GUI kills the Python process — don't do it.
 - fluorosim OptiX warnings are harmless — falls back to Slang shader path.
-- Keep CT volumes at ≤256³ for 8GB VRAM.
+- CT volume VRAM budget: the full spine CT at (797,512,512) float32 uses
+  ~836 MB for the μ-volume + ~836 MB for Slang gradient textures = ~1.7 GB
+  total, well within 8 GB. The old "≤256³" guideline was conservative. The
+  practical limit is more like ~500³ at float32 (~500 MB volume + gradients)
+  before you start competing with the rest of the pipeline for VRAM.
 - ALWAYS launch Isaac Sim with conda deactivated. If conda base is active,
   pip installs land in ~/.local/lib/python3.10/site-packages which is NOT
   on Isaac Sim's sys.path. Isaac Sim's kit Python site-packages are at:
@@ -446,6 +495,62 @@ Commands (in order):
   in fluorosim's deps). The Phase 5 registration wrapper uses a derived
   image `fluorosim-torch` built from bridge/fluorosim_torch.Dockerfile. Don't
   expect `python -c "import torch"` to work inside the plain `fluorosim` image.
+- fluorosim-torch image already ships pydicom 3.0.2 + SimpleITK 2.5.4 + scipy;
+  no extra deps needed for the DICOM loader. They are NOT in the base
+  fluorosim image — ct_loader.py only works in fluorosim-torch.
+- SimpleITK's ImageSeriesReader reports a *uniform* slice spacing derived from
+  SliceThickness (0.5 mm for the spine series) even when adjacent
+  ImagePositionPatient z-coords suggest a finer effective spacing. Trust
+  SimpleITK's spacing — pydicom-via-header arithmetic on two endpoint slices
+  can mislead.
+- ct_loader.py auto-detects the vertebral body centre via find_vertebral_center()
+  (compact-bone heuristic in the central X-Y window, middle 80% of Z, with Y
+  centroid detection so the crop lands on the actual posterior vertebral body).
+  Override with CT_CROP_CENTER_ZYX="z,y,x" when the auto-detection picks the
+  wrong level. The DICOM-SEG at .../04098/86171/ (Spine Segmentation) is
+  available if a mask-driven bbox is ever needed but is not currently used.
+- The geometric volume center is NOT a reliable crop center for long CT series.
+  The skin-to-skin spine CT has its center in the head/neck (z=398 of 797).
+  Confirmed by rendering 3 orthogonal DRRs: head anatomy visible, no spine.
+  Always verify with a sagittal/axial slice plot of the μ-volume after first load.
+- CT runs must currently set USE_POSE_JSON=0. The live pose.json still encodes
+  the synthetic ellipsoid placement (PHANTOM_POS_WORLD_M=(0.43,0,0.42)), so the
+  world-frame ground-truth report is meaningless for real-CT runs until
+  phantom.py and robot_scene.py are updated to use the CT mesh. The
+  fluorosim-translation-space error is unaffected.
+- VolumePreprocessor HU→μ LUT clamps at μ_water (0.020 mm⁻¹) — bone gets
+  zero extra attenuation over soft tissue and is invisible in DRRs. ct_loader.py
+  calls VolumePreprocessor only for metadata, then immediately overwrites
+  mu_volume.npy with bilinear hu_to_mu() output (μ_bone ≈ 0.048 mm⁻¹ at
+  HU 1000). Never call VolumePreprocessor.preprocess() directly on CT data.
+- Deleting the cache dir forces a rebuild. The cache hit check is existence-only,
+  not a content hash. Delete and re-run run_load_ct.sh after changing the crop
+  centre, bone threshold, or μ parameters.
+- fluorosim projection axis mapping for a CT in (Z,Y,X) = (axial,AP,LR) order:
+    ry=0°   → beam along CT Z axis (head→feet, coronal projection)
+    ry=90°  → beam along CT X axis (left→right, lateral projection)
+    rx=90°  → beam along CT Y axis (ant→post, TRUE clinical AP spine view)
+  The "AP" label in register_phantom_multiview.py (ry=0°) is the coronal view.
+  For clinical-style AP spine fluoroscopy, rx=90° is the correct angle. For
+  registration accuracy it does not matter — depth ambiguity is collapsed by
+  the orthogonal second view regardless of which axis is called "AP."
+- fluorosim normalize=False output is the LINE INTEGRAL L=∫μ dl (nepers), NOT
+  transmitted intensity exp(-L). Verified: raw range [0,0.63] for a lumbar AP
+  view matches soft-tissue path integrals. Applying log1p(L×500) then p1–p99
+  clip gives bone=bright, air=dark — identical to real X-ray film response.
+- DRR display transform is completely decoupled from the registration optimizer.
+  The optimizer uses normalize=True, invert=True [0,1] images internally.
+  plot_registration_multiview.py applies log1p(x×50)+p2–p98 purely for
+  visualization. Changing display parameters has zero effect on the loss or
+  recovered translation. gamma < 1 overexposes inverted images — always use
+  a log-based transform for DRR display.
+- Full-volume CT (CT_FULL_VOLUME=1) gives ~0.076–0.085 mm vs ~0.096 mm for the
+  cropped ROI in recent tests (similar or slightly better because the lateral
+  view through the full body has richer gradient signal). Use full mode for
+  anatomy-rich DRRs; cropped mode when speed matters.
+- run_register*.sh sets `-w /workspace` so that `from ct_loader import ...`
+  resolves against the mounted /workspace/ct_loader.py. Without this, Python
+  only finds ct_loader if cwd happens to be /workspace.
 
 ---
 
@@ -498,6 +603,32 @@ python3 ~/isaac_projects/bridge/plot_registration_multiview.py
 # (host-side, no Docker). Falls back to single-view if multi-view absent.
 python3 ~/isaac_projects/bridge/compute_robot_to_anatomy.py
 python3 ~/isaac_projects/bridge/compute_robot_to_anatomy.py --show  # interactive window
+
+# Phase 5d: pre-warm the real-CT cache (one-time; auto-detects vertebral level)
+~/isaac_projects/bridge/run_load_ct.sh                 # cropped ROI, auto centre
+CT_FULL_VOLUME=1 ~/isaac_projects/bridge/run_load_ct.sh   # full 797×512×512
+# Override DICOM source (default = spine_mets_ct_seg/10250/04098/27242):
+DICOM_PATH=/path/to/dicom_dir ~/isaac_projects/bridge/run_load_ct.sh
+# Override crop centre when auto-detection picks the wrong anatomy level
+# (z,y,x are voxel indices in the full CT array — Z=axial slice, Y=row, X=col):
+CT_CROP_CENTER_ZYX="568,252,256" ~/isaac_projects/bridge/run_load_ct.sh
+
+# Phase 5d: run registration against the real CT (instead of synthetic).
+# Must use USE_POSE_JSON=0 until phantom.py is updated for the CT geometry.
+DICOM_PATH=~/medical_imaging/spine_mets_ct_seg/10250/04098/27242 \
+  USE_POSE_JSON=0 INIT_OFFSET_MM="20,0,15" \
+  ~/isaac_projects/bridge/run_register_multiview.sh
+# Full-volume variant (836 MB, 158 ms/iter, ~0.076 mm error):
+DICOM_PATH=~/medical_imaging/spine_mets_ct_seg/10250/04098/27242 \
+  CT_FULL_VOLUME=1 USE_POSE_JSON=0 \
+  ~/isaac_projects/bridge/run_register_multiview.sh
+# Manual crop centre override also propagates into the registration wrappers:
+DICOM_PATH=~/medical_imaging/spine_mets_ct_seg/10250/04098/27242 \
+  CT_CROP_CENTER_ZYX="568,252,256" USE_POSE_JSON=0 \
+  ~/isaac_projects/bridge/run_register_multiview.sh
+# Same flags work for the single-view script:
+DICOM_PATH=~/medical_imaging/spine_mets_ct_seg/10250/04098/27242 \
+  USE_POSE_JSON=0 ~/isaac_projects/bridge/run_register.sh
 
 # Build the derived torch-enabled image (one-time, ~5 min for the wheel download)
 docker build -t fluorosim-torch -f ~/isaac_projects/bridge/fluorosim_torch.Dockerfile \

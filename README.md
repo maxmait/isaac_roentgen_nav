@@ -11,9 +11,15 @@ planning would consume.
 |---|---|---|
 | ![Franka + phantom](docs/images/franka_phantom_scene.jpg) | ![DRR with tool](docs/images/drr_with_tool.png) | ![T_R^A layout](docs/images/robot_to_anatomy_layout.png) |
 
-**Current headline result** on the synthetic ellipsoid phantom: two sequential
-C-arm shots (AP + 90° lateral) recover the phantom position to **~0.05 mm**
-vs Isaac Sim ground truth, in ~10 s on an RTX 4060 Laptop.
+**Current headline results** — two sequential C-arm shots (AP + 90° lateral):
+
+| Volume | Error ‖err‖ | Time |
+|---|---|---|
+| Synthetic ellipsoid | **0.05 mm** vs Isaac Sim GT | ~10 s |
+| Real spine CT — cropped 128 mm³ ROI | **0.037 mm** | 9.4 s |
+| Real spine CT — full 797×512×512 scan | **0.085 mm** | 15.6 s |
+
+All on an RTX 4060 Laptop GPU (8 GB VRAM). The full CT fits with room to spare.
 
 ---
 
@@ -106,7 +112,7 @@ Full input audit:
 | Robot EE pose | Isaac Sim FK | Joint encoders → FK | ✓ |
 | C-arm pose | Set in `pose.json` | Hand-eye calibration C-arm ↔ robot (one-time) | ✓ |
 | C-arm gantry angle per shot | Hardcoded 0° / 90° | Gantry encoders | ✓ |
-| CT μ-volume | Synthetic cache | Pre-op CT, segmented HU→μ | ✓ (mechanism identical) |
+| CT μ-volume | Real DICOM spine CT or synthetic cache | Pre-op CT, segmented HU→μ | ✓ (mechanism identical) |
 | Target X-ray | Rendered by fluorosim | Actual X-ray photons | ✓ (same Beer–Lambert physics) |
 | Optimizer initial guess | `gt + INIT_OFFSET_MM` | Planning prior or "anatomy at isocenter" | ⚠ uses GT as basis for testing; easily replaced with a fixed prior |
 | Ground-truth phantom pose (for scoring) | `pose.json` | Sim-only — NOT used by the optimizer | Validation reference only |
@@ -184,6 +190,20 @@ bridge/run_fluorosim.sh          # renders DRR with tool painted in
 python3 bridge/visualize_drr.py  # annotated PNG + sanity check
 ```
 
+### Optional: register against a real DICOM CT
+
+```bash
+# One-time: build the CT cache (cropped 128 mm³ ROI, ~10 s)
+bridge/run_load_ct.sh
+# Or the full scan (797×512×512, no resampling, ~20 s)
+CT_FULL_VOLUME=1 bridge/run_load_ct.sh
+
+# Run multi-view registration with real CT (USE_POSE_JSON=0 until Isaac Sim
+# mesh is updated to match the CT geometry)
+DICOM_PATH=~/medical_imaging/spine_mets_ct_seg/10250/04098/27242 \
+  USE_POSE_JSON=0 bridge/run_register_multiview.sh
+```
+
 ### Optional: single-view baseline (for comparison)
 
 ```bash
@@ -222,6 +242,20 @@ lateral view and its gradient is strong there.
 
 ![Registration convergence](docs/images/registration_multiview_convergence.png)
 
+### Real CT results
+
+The same multi-view registration runs against a real 797-slice spine CT
+(`bridge/ct_loader.py` + `DICOM_PATH` env var):
+
+| CT mode | Volume | ‖err‖ | ms/iter |
+|---|---|---|---|
+| Cropped ROI | (128,256,256) @ 1×0.5×0.5 mm | **0.037 mm** | 95 ms |
+| Full volume | (797,512,512) @ 0.5×0.7×0.7 mm | **0.085 mm** | 156 ms |
+
+Both fit within 8 GB VRAM. The cropped-ROI path gives better accuracy
+(the FOV sees only bone; every gradient step is informative); the full-volume
+path requires no resampling and produces realistic torso DRRs.
+
 ### End-to-end result on a real Isaac Sim scene
 
 ```
@@ -259,7 +293,9 @@ isaac_roentgen_nav/
 │   ├── register_phantom_multiview.py  # sequential AP + lateral registration
 │   ├── run_register_multiview.sh      # wrapper for multi-view
 │   ├── plot_registration_multiview.py # host: per-view losses + image grid
-│   └── compute_robot_to_anatomy.py    # host: registration → T_R^A, T_R^C, T_A^C
+│   ├── compute_robot_to_anatomy.py    # host: registration → T_R^A, T_R^C, T_A^C
+│   ├── ct_loader.py                   # DICOM CT → PreprocessedVolume (cropped or full)
+│   └── run_load_ct.sh                 # one-time CT cache builder
 ├── docs/images/                       # committed reference images for this README
 ├── output/                            # runtime artifacts — gitignored
 ├── CLAUDE.md                          # detailed implementation log, gotchas
@@ -283,13 +319,20 @@ isaac_roentgen_nav/
 - **Phase 5** — Translation-only registration; single-view (0.41 mm) and
   multi-view (0.05 mm); `compute_robot_to_anatomy.py` produces T_R^A;
   end-to-end test on a live Isaac Sim scene
+- **Phase 5d** — Real DICOM CT integration: `bridge/ct_loader.py` loads a
+  797-slice spine CT via SimpleITK; `DICOM_PATH` + `CT_FULL_VOLUME` env vars
+  select real CT vs synthetic and cropped vs full volume. Multi-view
+  registration on the real CT converges to **0.037 mm** (cropped ROI) and
+  **0.085 mm** (full 797×512×512 scan), both within 8 GB VRAM
 
 **Next:**
 
+- **Isaac Sim CT mesh** — build a USD mesh from the CT (marching cubes on
+  the segmented volume) to replace the analytic ellipsoid in `robot_scene.py`;
+  update `scenes/phantom.py` constants so `compute_robot_to_anatomy.py` works
+  end-to-end against the real CT phantom
 - **6-DOF registration** — extend to translation + rotation (phantom
-  orientation is currently assumed identity)
-- **Real CT phantom** — replace the synthetic ellipsoid with a segmented
-  DICOM volume (marching-cubes mesh for Isaac Sim + μ-volume for fluorosim)
+  orientation currently assumed identity)
 - **Trajectory planning** — consume T_R^A to drive the Franka toward a
   surgical target while maintaining the tool tip inside a safety region
 
