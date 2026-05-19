@@ -51,6 +51,15 @@ CACHE_DIR = IO_DIR / "fluorosim_cache"
 OUT_DIR = IO_DIR / "registration_multiview"
 POSE_FILE = IO_DIR / "pose.json"
 
+# If set, load the μ-volume from a DICOM CT instead of the synthetic ellipsoid.
+# The DICOM_PATH value is the in-container path to the DICOM dir (the host
+# wrapper script mounts the host DICOM dir there and sets this var).
+DICOM_PATH = os.environ.get("DICOM_PATH")
+# CT_FULL_VOLUME=1 → use the entire CT at native spacing (no crop/resample).
+# Cache dirs are kept separate so both variants can coexist on disk.
+CT_FULL_VOLUME = os.environ.get("CT_FULL_VOLUME", "0") == "1"
+CACHE_DIR_CT = IO_DIR / ("fluorosim_cache_ct_full" if CT_FULL_VOLUME else "fluorosim_cache_ct")
+
 
 def _envf(name: str, default: float) -> float:
     return float(os.environ.get(name, default))
@@ -132,6 +141,16 @@ def load_or_build_synthetic_volume() -> PreprocessedVolume:
     ).preprocess(output_dir=CACHE_DIR)
 
 
+def load_volume() -> PreprocessedVolume:
+    if DICOM_PATH:
+        from ct_loader import load_or_build_ct_volume
+        mode = "full" if CT_FULL_VOLUME else "cropped ROI"
+        print(f"  Source: real CT ({mode}) at DICOM_PATH={DICOM_PATH}")
+        return load_or_build_ct_volume(Path(DICOM_PATH), CACHE_DIR_CT, full_volume=CT_FULL_VOLUME)
+    print("  Source: synthetic ellipsoid phantom")
+    return load_or_build_synthetic_volume()
+
+
 def main() -> int:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -162,7 +181,7 @@ def main() -> int:
     print(f"Iterations:                    {N_ITERS}")
 
     print("\n[1] Loading μ-volume...")
-    volume = load_or_build_synthetic_volume()
+    volume = load_volume()
     mu = volume.mu_volume
     spacing = volume.spacing_zyx_mm
     print(f"  shape={mu.shape}, spacing_mm={spacing}, μ range=[{mu.min():.4f}, {mu.max():.4f}]")
