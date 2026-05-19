@@ -55,6 +55,16 @@ from phantom import (  # noqa: E402
     SOFT_TISSUE_SEMIAXES_M,
 )
 
+# Cached CT μ-volumes — if present, use them for data-driven inside/outside
+# checks (more accurate than the analytic ellipsoid heuristic).
+CT_CACHE_CROPPED = OUT_DIR / "fluorosim_cache_ct"
+CT_CACHE_FULL    = OUT_DIR / "fluorosim_cache_ct_full"
+
+# μ thresholds (mm⁻¹) for the data-driven clinical check.  Matches the
+# bilinear HU→μ conversion in bridge/ct_loader.py.
+MU_BONE_THRESH  = 0.035   # > trabecular bone
+MU_TISSUE_THRESH = 0.012  # > soft tissue (air ≈ 0.0001, water ≈ 0.020)
+
 
 # ─── tiny rigid-transform helper ──────────────────────────────────────────────
 @dataclass
@@ -153,7 +163,71 @@ def normalized_ellipsoid_distance(point_m, semiaxes_m) -> float:
     return float(np.sqrt(np.sum((p / s) ** 2)))
 
 
+def _ct_mu_at_anatomy_point(cache_dir: Path, ee_anatomy_m: np.ndarray) -> float | None:
+    """Look up μ (mm⁻¹) at a point in anatomy frame using a cached CT volume.
+
+    The cached volume's isocenter is at the anatomy-frame origin, so an
+    anatomy-frame point in mm maps directly to a voxel index via the
+    volume's spacing.  Returns None if the point is outside the volume.
+    """
+    mu_path   = cache_dir / "mu_volume.npy"
+    meta_path = cache_dir / "metadata.json"
+    if not mu_path.exists() or not meta_path.exists():
+        return None
+    mu      = np.load(str(mu_path), mmap_mode="r")
+    meta    = json.loads(meta_path.read_text())
+    spacing = np.asarray(meta["spacing_zyx_mm"], dtype=np.float64)
+    shape   = np.asarray(mu.shape, dtype=np.float64)
+
+    # Anatomy frame mm (X, Y, Z) → voxel index (Z, Y, X)
+    p_mm = ee_anatomy_m * 1000.0
+    p_zyx_mm = np.array([p_mm[2], p_mm[1], p_mm[0]])
+    voxel = p_zyx_mm / spacing + (shape - 1) / 2.0
+    idx = np.round(voxel).astype(int)
+    if np.any(idx < 0) or np.any(idx >= np.asarray(mu.shape)):
+        return None
+    return float(mu[idx[0], idx[1], idx[2]])
+
+
 def clinical_summary(ee_in_anatomy_m: np.ndarray) -> dict:
+    """Data-driven anatomy check when a CT cache exists, ellipsoid fallback otherwise.
+
+    With a CT cache: look up the local μ value at the EE position in anatomy
+    frame and classify by μ thresholds (bone, soft tissue, outside).  This
+    uses the same μ values fluorosim integrates along its rays — perfectly
+    consistent with the registration.
+
+    Without a CT cache: fall back to the synthetic ellipsoid check.
+    """
+    # Prefer cropped (matches the registration ROI); fall back to full volume.
+    for cache in (CT_CACHE_CROPPED, CT_CACHE_FULL):
+        mu = _ct_mu_at_anatomy_point(cache, ee_in_anatomy_m)
+        if mu is not None:
+            inside_bone = mu > MU_BONE_THRESH
+            inside_soft = mu > MU_TISSUE_THRESH
+            if inside_bone:
+                interp = (f"Tool tip is inside bone "
+                          f"(local μ={mu:.4f} mm⁻¹ > bone threshold {MU_BONE_THRESH}).")
+            elif inside_soft:
+                interp = (f"Tool tip is in soft tissue "
+                          f"(local μ={mu:.4f} mm⁻¹, "
+                          f"thresholds: soft {MU_TISSUE_THRESH}, bone {MU_BONE_THRESH}).")
+            else:
+                interp = (f"Tool tip is in air or outside the CT (local μ="
+                          f"{mu:.4f} mm⁻¹ < soft-tissue threshold).")
+            return {
+                "method": "ct_mu_lookup",
+                "ct_cache": str(cache),
+                "ee_pos_in_anatomy_mm_recovered": (ee_in_anatomy_m * 1000.0).tolist(),
+                "local_mu_mm_inv": mu,
+                "mu_bone_thresh": MU_BONE_THRESH,
+                "mu_tissue_thresh": MU_TISSUE_THRESH,
+                "inside_bone_core": inside_bone,
+                "inside_soft_tissue": inside_soft,
+                "interpretation": interp,
+            }
+
+    # Synthetic ellipsoid fallback (no CT cache available)
     d_bone = normalized_ellipsoid_distance(ee_in_anatomy_m, BONE_CORE_SEMIAXES_M)
     d_soft = normalized_ellipsoid_distance(ee_in_anatomy_m, SOFT_TISSUE_SEMIAXES_M)
     inside_bone = d_bone < 1.0
@@ -168,6 +242,7 @@ def clinical_summary(ee_in_anatomy_m: np.ndarray) -> dict:
         interp = (f"Tool tip is OUTSIDE the phantom (bone {d_bone:.2f}, "
                   f"soft {d_soft:.2f} — both > 1).")
     return {
+        "method": "ellipsoid",
         "ee_pos_in_anatomy_mm_recovered": (ee_in_anatomy_m * 1000.0).tolist(),
         "bone_core_normalized_distance": d_bone,
         "soft_tissue_normalized_distance": d_soft,
@@ -186,6 +261,28 @@ def draw_ellipse(ax, semi_a_mm, semi_b_mm, edgecolor, label):
     ax.add_patch(e)
 
 
+def _load_ct_slices_for_layout() -> dict | None:
+    """Return mu-volume slices through the origin (anatomy isocenter), or None."""
+    for cache in (CT_CACHE_CROPPED, CT_CACHE_FULL):
+        mu_path = cache / "mu_volume.npy"
+        meta_path = cache / "metadata.json"
+        if mu_path.exists() and meta_path.exists():
+            mu      = np.load(str(mu_path), mmap_mode="r")
+            meta    = json.loads(meta_path.read_text())
+            spacing = meta["spacing_zyx_mm"]  # (sz, sy, sx) mm
+            nz, ny, nx = mu.shape
+            # Anatomy origin = volume centre voxel
+            z0, y0, x0 = (nz - 1) // 2, (ny - 1) // 2, (nx - 1) // 2
+            return {
+                "axial":    np.asarray(mu[z0, :, :]),  # XY plane, +Z out of page
+                "coronal":  np.asarray(mu[:, y0, :]),  # XZ plane, +Y into page
+                "spacing":  spacing,
+                "shape":    mu.shape,
+                "cache":    str(cache),
+            }
+    return None
+
+
 def make_layout_plot(ee_anatomy_mm: np.ndarray,
                      phantom_err_mm: np.ndarray,
                      err_norm_mm: float,
@@ -199,50 +296,78 @@ def make_layout_plot(ee_anatomy_mm: np.ndarray,
         print("(matplotlib not available — skipping layout plot)")
         return
 
-    soft_x, soft_y, soft_z = (v * 1000.0 for v in SOFT_TISSUE_SEMIAXES_M)
-    bone_x, bone_y, bone_z = (v * 1000.0 for v in BONE_CORE_SEMIAXES_M)
-
     fig, (ax_xy, ax_xz) = plt.subplots(1, 2, figsize=(12, 5.5))
 
-    # Left: top-down (X, Y), Z out of page
-    draw_ellipse(ax_xy, soft_x, soft_y, "#d68a82", "soft tissue (30×30 mm)")
-    draw_ellipse(ax_xy, bone_x, bone_y, "#888888", "bone core (20×20 mm)")
-    ax_xy.plot(ee_anatomy_mm[0], ee_anatomy_mm[1], "o", color="#2ca02c",
-               ms=10, label=f"EE  ({ee_anatomy_mm[0]:.2f}, {ee_anatomy_mm[1]:.2f}) mm")
-    ax_xy.plot(0, 0, "+", color="#555", ms=12, mew=2, label="GT phantom origin")
-    ax_xy.plot(phantom_err_mm[0], phantom_err_mm[1], "x", color="#ff7f0e",
-               ms=10, mew=2,
-               label=f"Recov. phantom Δ ({err_norm_mm:.3f} mm)")
-    ax_xy.set_xlabel("X (mm) — anatomy frame")
-    ax_xy.set_ylabel("Y (mm) — anatomy frame")
-    ax_xy.set_title("Top-down view  (XY plane, +Z out of page)")
-    ax_xy.grid(True, alpha=0.3)
-    ax_xy.set_aspect("equal")
-    ax_xy.set_xlim(-45, 45)
-    ax_xy.set_ylim(-45, 45)
-    ax_xy.legend(fontsize=8, loc="upper right")
+    ct = _load_ct_slices_for_layout()
+    if ct is not None:
+        # CT-backed layout: show actual μ-volume slices through the isocenter
+        sz, sy, sx = ct["spacing"]
+        nz, ny, nx = ct["shape"]
+        half_x = (nx - 1) * sx / 2.0
+        half_y = (ny - 1) * sy / 2.0
+        half_z = (nz - 1) * sz / 2.0
 
-    # Right: side view (X, Z), Y into page
-    draw_ellipse(ax_xz, soft_x, soft_z, "#d68a82", "soft tissue (30×60 mm)")
-    draw_ellipse(ax_xz, bone_x, bone_z, "#888888", "bone core (20×40 mm)")
-    ax_xz.plot(ee_anatomy_mm[0], ee_anatomy_mm[2], "o", color="#2ca02c",
-               ms=10, label=f"EE  ({ee_anatomy_mm[0]:.2f}, {ee_anatomy_mm[2]:.2f}) mm")
-    ax_xz.plot(0, 0, "+", color="#555", ms=12, mew=2, label="GT phantom origin")
-    ax_xz.plot(phantom_err_mm[0], phantom_err_mm[2], "x", color="#ff7f0e",
-               ms=10, mew=2,
-               label=f"Recov. phantom Δ ({err_norm_mm:.3f} mm)")
-    ax_xz.set_xlabel("X (mm) — anatomy frame")
-    ax_xz.set_ylabel("Z (mm) — anatomy frame")
-    ax_xz.set_title("Side view  (XZ plane, +Y into page)")
-    ax_xz.grid(True, alpha=0.3)
-    ax_xz.set_aspect("equal")
-    ax_xz.set_xlim(-45, 45)
-    ax_xz.set_ylim(-75, 75)
-    ax_xz.legend(fontsize=8, loc="upper right")
+        # Log+percentile display, like the DRR plots
+        def _show(ax, sl, extent, xlabel, ylabel, title):
+            log = np.log1p(sl * 50)
+            p1, p99 = np.percentile(log, 1), np.percentile(log, 99)
+            ax.imshow(log, cmap="bone", origin="lower", extent=extent,
+                      vmin=p1, vmax=p99, aspect="equal")
+            ax.set_xlabel(xlabel)
+            ax.set_ylabel(ylabel)
+            ax.set_title(title)
+            ax.grid(True, alpha=0.2, color="white")
+
+        # Left: axial slice (XY plane)
+        _show(ax_xy, ct["axial"],
+              extent=[-half_x, half_x, -half_y, half_y],
+              xlabel="X (mm) — anatomy frame",
+              ylabel="Y (mm) — anatomy frame",
+              title=f"Axial CT slice  z=0  (XY plane)")
+        # Right: coronal slice (XZ plane)
+        _show(ax_xz, ct["coronal"],
+              extent=[-half_x, half_x, -half_z, half_z],
+              xlabel="X (mm) — anatomy frame",
+              ylabel="Z (mm) — anatomy frame",
+              title=f"Coronal CT slice  y=0  (XZ plane)")
+        plot_method = f"CT μ-slices ({Path(ct['cache']).name})"
+    else:
+        # Ellipsoid fallback for the synthetic phantom
+        soft_x, soft_y, soft_z = (v * 1000.0 for v in SOFT_TISSUE_SEMIAXES_M)
+        bone_x, bone_y, bone_z = (v * 1000.0 for v in BONE_CORE_SEMIAXES_M)
+        draw_ellipse(ax_xy, soft_x, soft_y, "#d68a82", "soft tissue (30×30 mm)")
+        draw_ellipse(ax_xy, bone_x, bone_y, "#888888", "bone core (20×20 mm)")
+        draw_ellipse(ax_xz, soft_x, soft_z, "#d68a82", "soft tissue (30×60 mm)")
+        draw_ellipse(ax_xz, bone_x, bone_z, "#888888", "bone core (20×40 mm)")
+        ax_xy.set_xlim(-45, 45); ax_xy.set_ylim(-45, 45); ax_xy.set_aspect("equal")
+        ax_xz.set_xlim(-45, 45); ax_xz.set_ylim(-75, 75); ax_xz.set_aspect("equal")
+        ax_xy.set_xlabel("X (mm) — anatomy frame")
+        ax_xy.set_ylabel("Y (mm) — anatomy frame")
+        ax_xy.set_title("Top-down view  (XY plane, +Z out of page)")
+        ax_xz.set_xlabel("X (mm) — anatomy frame")
+        ax_xz.set_ylabel("Z (mm) — anatomy frame")
+        ax_xz.set_title("Side view  (XZ plane, +Y into page)")
+        ax_xy.grid(True, alpha=0.3)
+        ax_xz.grid(True, alpha=0.3)
+        plot_method = "synthetic ellipsoid"
+
+    # Overlay markers on both views — same for CT or ellipsoid
+    for ax, (xi, yi, xlbl, ylbl) in [
+        (ax_xy, (0, 1, "X", "Y")),
+        (ax_xz, (0, 2, "X", "Z")),
+    ]:
+        ax.plot(ee_anatomy_mm[xi], ee_anatomy_mm[yi], "o",
+                color="#2ca02c", ms=10, markeredgecolor="white", mew=1.2,
+                label=f"EE  ({ee_anatomy_mm[xi]:.2f}, {ee_anatomy_mm[yi]:.2f}) mm")
+        ax.plot(0, 0, "+", color="#ffeb3b", ms=14, mew=2.5,
+                label="GT phantom origin")
+        ax.plot(phantom_err_mm[xi], phantom_err_mm[yi], "x", color="#ff7f0e",
+                ms=10, mew=2, label=f"Recov. phantom Δ ({err_norm_mm:.3f} mm)")
+        ax.legend(fontsize=8, loc="upper right")
 
     fig.suptitle(
         f"Robot EE relative to recovered anatomy frame  |  "
-        f"world ||err|| = {err_norm_mm:.3f} mm",
+        f"world ||err|| = {err_norm_mm:.3f} mm  |  background: {plot_method}",
         fontsize=11,
     )
     fig.tight_layout()
@@ -333,16 +458,24 @@ def main() -> int:
     print()
 
     print("=" * 60)
-    print("Clinical interpretation")
+    print(f"Clinical interpretation  (method: {clin['method']})")
     print("=" * 60)
     print(f"  EE position in anatomy frame (mm):  "
           f"{_fmt(np.asarray(clin['ee_pos_in_anatomy_mm_recovered']))}")
     inside_b = "INSIDE" if clin["inside_bone_core"] else "OUTSIDE"
     inside_s = "INSIDE" if clin["inside_soft_tissue"] else "OUTSIDE"
-    print(f"  Normalized distance to bone core:   "
-          f"{clin['bone_core_normalized_distance']:.3f}  -> {inside_b} bone")
-    print(f"  Normalized distance to soft tissue: "
-          f"{clin['soft_tissue_normalized_distance']:.3f}  -> {inside_s} soft tissue")
+    if clin["method"] == "ct_mu_lookup":
+        print(f"  Local μ at EE position:           "
+              f"{clin['local_mu_mm_inv']:.4f} mm⁻¹")
+        print(f"    Bone threshold ({clin['mu_bone_thresh']}):"
+              f"      {inside_b} bone")
+        print(f"    Soft-tissue threshold ({clin['mu_tissue_thresh']}):"
+              f" {inside_s} soft tissue")
+    else:
+        print(f"  Normalized distance to bone core:   "
+              f"{clin['bone_core_normalized_distance']:.3f}  -> {inside_b} bone")
+        print(f"  Normalized distance to soft tissue: "
+              f"{clin['soft_tissue_normalized_distance']:.3f}  -> {inside_s} soft tissue")
     print(f"  -> {clin['interpretation']}")
     print()
 
