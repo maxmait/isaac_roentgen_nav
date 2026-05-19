@@ -17,6 +17,7 @@ from phantom import (
     BONE_CORE_COLOR,
     BONE_CORE_PATH,
     BONE_CORE_SEMIAXES_M,
+    CT_PHANTOM_MESH_OBJ,
     PHANTOM_POS_WORLD_M,
     PHANTOM_QUAT_WXYZ,
     PHANTOM_ROOT_PATH,
@@ -51,30 +52,94 @@ def add_ellipsoid(
     center_world_m: tuple[float, float, float],
     color: tuple[float, float, float],
 ) -> None:
-    """Add a UsdGeom.Sphere at `path` with non-uniform scale to form an ellipsoid.
-
-    semiaxes_m is given in Isaac Sim (X, Y, Z) order. The sphere's unit radius
-    is scaled by these semiaxes; the prim is translated to center_world_m.
-    """
+    """Add a UsdGeom.Sphere at `path` with non-uniform scale to form an ellipsoid."""
     sphere = UsdGeom.Sphere.Define(stage, path)
     sphere.CreateRadiusAttr(1.0)
-    # Set extent so frustum culling / bbox computations match the scaled mesh.
     sphere.CreateExtentAttr([(-1.0, -1.0, -1.0), (1.0, 1.0, 1.0)])
     sphere.CreateDisplayColorAttr(Vt.Vec3fArray([Gf.Vec3f(*color)]))
-
     xformable = UsdGeom.Xformable(sphere)
     xformable.ClearXformOpOrder()
     xformable.AddTranslateOp().Set(Gf.Vec3d(*center_world_m))
     xformable.AddScaleOp().Set(Gf.Vec3f(*semiaxes_m))
 
 
+def _load_obj(path) -> tuple[np.ndarray, np.ndarray]:
+    """Load mesh from numpy arrays (fast) or parse OBJ text (fallback)."""
+    from pathlib import Path
+    p = Path(path)
+    verts_npy = p.with_suffix(".verts.npy")
+    faces_npy = p.with_suffix(".faces.npy")
+    if verts_npy.exists() and faces_npy.exists():
+        return np.load(str(verts_npy)), np.load(str(faces_npy))
+    # Fallback: parse OBJ text
+    verts, faces = [], []
+    with open(p) as f:
+        for line in f:
+            if line.startswith("v "):
+                verts.append([float(x) for x in line.split()[1:4]])
+            elif line.startswith("f "):
+                idx = [int(tok.split("/")[0]) - 1 for tok in line.split()[1:4]]
+                faces.append(idx)
+    return np.array(verts, dtype=np.float32), np.array(faces, dtype=np.int32)
+
+
+def add_ct_mesh(
+    stage,
+    path: str,
+    obj_path,
+    center_world_m: tuple[float, float, float],
+) -> bool:
+    """Load the CT bone mesh (OBJ, metres, centred) as a UsdGeom.Mesh prim.
+
+    Vertices are already in Isaac Sim world convention (X, Y, Z metres) and
+    centred at the volume isocenter.  A single translate op places the mesh
+    at center_world_m.  Returns True on success.
+    """
+    try:
+        verts, faces = _load_obj(obj_path)
+    except Exception as e:
+        print(f"  WARNING: could not load CT mesh from {obj_path}: {e}",
+              file=sys.stderr)
+        return False
+
+    mesh = UsdGeom.Mesh.Define(stage, path)
+    # Use list() conversion — Vt arrays accept flat Python lists efficiently.
+    mesh.CreatePointsAttr(Vt.Vec3fArray(verts.tolist()))
+    mesh.CreateFaceVertexIndicesAttr(Vt.IntArray(faces.flatten().tolist()))
+    mesh.CreateFaceVertexCountsAttr(Vt.IntArray([3] * len(faces)))
+    mesh.CreateSubdivisionSchemeAttr("none")
+    mesh.CreateDisplayColorAttr(
+        Vt.Vec3fArray([Gf.Vec3f(0.93, 0.90, 0.82)])   # warm bone colour
+    )
+    xf = UsdGeom.Xformable(mesh)
+    xf.ClearXformOpOrder()
+    xf.AddTranslateOp().Set(Gf.Vec3d(*center_world_m))
+    print(f"  CT mesh loaded: {len(verts):,} verts  {len(faces):,} faces"
+          f"  → {path}")
+    return True
+
+
 stage = world.stage
-# Parent Xform so the two ellipsoids share a single isocenter transform.
 UsdGeom.Xform.Define(stage, PHANTOM_ROOT_PATH)
-add_ellipsoid(stage, SOFT_TISSUE_PATH, SOFT_TISSUE_SEMIAXES_M,
-              PHANTOM_POS_WORLD_M, SOFT_TISSUE_COLOR)
-add_ellipsoid(stage, BONE_CORE_PATH, BONE_CORE_SEMIAXES_M,
-              PHANTOM_POS_WORLD_M, BONE_CORE_COLOR)
+
+# Use the CT mesh when available; fall back to analytic ellipsoids.
+if CT_PHANTOM_MESH_OBJ.exists():
+    print(f"\n[Phantom] Loading CT mesh from {CT_PHANTOM_MESH_OBJ} ...")
+    ok = add_ct_mesh(stage, PHANTOM_ROOT_PATH + "/Mesh",
+                     CT_PHANTOM_MESH_OBJ, PHANTOM_POS_WORLD_M)
+    if not ok:
+        print("[Phantom] Mesh load failed — falling back to synthetic ellipsoids.")
+        add_ellipsoid(stage, SOFT_TISSUE_PATH, SOFT_TISSUE_SEMIAXES_M,
+                      PHANTOM_POS_WORLD_M, SOFT_TISSUE_COLOR)
+        add_ellipsoid(stage, BONE_CORE_PATH, BONE_CORE_SEMIAXES_M,
+                      PHANTOM_POS_WORLD_M, BONE_CORE_COLOR)
+else:
+    print(f"\n[Phantom] {CT_PHANTOM_MESH_OBJ} not found "
+          f"— using synthetic ellipsoid phantom.")
+    add_ellipsoid(stage, SOFT_TISSUE_PATH, SOFT_TISSUE_SEMIAXES_M,
+                  PHANTOM_POS_WORLD_M, SOFT_TISSUE_COLOR)
+    add_ellipsoid(stage, BONE_CORE_PATH, BONE_CORE_SEMIAXES_M,
+                  PHANTOM_POS_WORLD_M, BONE_CORE_COLOR)
 
 world.reset()
 
