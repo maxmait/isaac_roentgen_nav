@@ -127,19 +127,43 @@ def main() -> int:
     print(f"\nSaved {CONVERGENCE_PNG}")
 
     # --- Figure 2: per-view target / recovered / diff ----------------------
+    def _window(img: np.ndarray) -> np.ndarray:
+        """Log-compressed display for normalize=True, invert=True DRRs.
+
+        fluorosim renders with invert=True so air=1 (bright) and bone=0
+        (dark).  A plain gamma or linear stretch "overexposes" soft tissue
+        because gamma < 1 brightens the mid-range.
+
+        Instead we:
+          1. Undo the invert  → bone becomes high, air becomes low
+          2. Apply log1p      → matches real X-ray film (logarithmic response)
+          3. p2–p98 clip      → stretch the tissue range to [0,1]
+
+        Result: bone=bright, air=dark — same appearance as the debug DRRs
+        rendered with normalize=False.
+        """
+        proxy = 1.0 - np.clip(img, 0.0, 1.0)       # undo invert: bone→high
+        log   = np.log1p(proxy * 50.0)               # log compression
+        p2, p98 = np.percentile(log, 2), np.percentile(log, 98)
+        clipped = np.clip(log, p2, p98)
+        return (clipped - p2) / max(p98 - p2, 1e-9)
+
     fig2, axes2 = plt.subplots(len(views), 3, figsize=(13, 4.5 * len(views)),
                                 squeeze=False)
     for vi, view in enumerate(views):
         target = np.load(REG_DIR / f"target_{view['name']}.npy")
         recovered = np.load(REG_DIR / f"recovered_{view['name']}.npy")
         diff = np.abs(target - recovered)
-        vmax_img = max(target.max(), recovered.max())
-        panels = [(target, "target", "gray"),
-                  (recovered, "recovered", "gray"),
-                  (diff, f"|diff|  max={diff.max():.4f}", "magma")]
+
+        t_disp = _window(target)
+        r_disp = _window(recovered)
+        panels = [(t_disp,    "target",                     "gray"),
+                  (r_disp,    "recovered",                  "gray"),
+                  (diff,      f"|diff|  max={diff.max():.4f}", "magma")]
         for ax, (img, label, cmap) in zip(axes2[vi], panels):
-            vmax = vmax_img if cmap == "gray" else diff.max()
-            im = ax.imshow(img, cmap=cmap, vmin=0, vmax=vmax)
+            vmin = 0
+            vmax = img.max() if cmap == "magma" else 1.0
+            im = ax.imshow(img, cmap=cmap, vmin=vmin, vmax=vmax)
             ax.set_title(f"{view['name']} ({view['angle_deg_y']:+.0f}°) — {label}",
                          fontsize=10)
             ax.axis("off")
