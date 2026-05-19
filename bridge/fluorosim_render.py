@@ -59,6 +59,13 @@ DRR_NPY = IO_DIR / "drr.npy"
 DRR_META = IO_DIR / "drr_meta.json"
 CACHE_DIR = IO_DIR / "fluorosim_cache"
 
+# Real-CT mode — same switch as the registration scripts.
+# DICOM_PATH=<container path>  → load μ-volume from cropped (or full) CT cache.
+# CT_FULL_VOLUME=1             → use the full-volume cache instead.
+DICOM_PATH = os.environ.get("DICOM_PATH")
+CT_FULL_VOLUME = os.environ.get("CT_FULL_VOLUME", "0") == "1"
+CACHE_DIR_CT = IO_DIR / ("fluorosim_cache_ct_full" if CT_FULL_VOLUME else "fluorosim_cache_ct")
+
 # Tool abstraction: dense sphere centered at the EE position.
 # - μ ≈ 0.5 mm⁻¹ is ~28× bone (~0.018) and makes the tool effectively opaque to
 #   X-rays (line-integral over a 30 mm chord ≈ 15 nepers → exp(−15) ≈ 0).
@@ -237,7 +244,15 @@ def main() -> int:
     print(f"      translation (mm):   ({tx_mm:.2f}, {ty_mm:.2f}, {tz_mm:.2f})")
 
     print("\n[1] Loading μ-volume...")
-    volume = load_or_build_synthetic_volume()
+    if DICOM_PATH:
+        from ct_loader import load_or_build_ct_volume
+        mode = "full" if CT_FULL_VOLUME else "cropped ROI"
+        print(f"  Source: real CT ({mode}) at DICOM_PATH={DICOM_PATH}")
+        volume = load_or_build_ct_volume(Path(DICOM_PATH), CACHE_DIR_CT,
+                                         full_volume=CT_FULL_VOLUME)
+    else:
+        print("  Source: synthetic ellipsoid phantom")
+        volume = load_or_build_synthetic_volume()
     print(f"  {volume}")
 
     print("\n[1b] Painting robot tool into μ-volume (in-memory copy)...")
