@@ -19,8 +19,10 @@ from pxr import Gf, UsdGeom
 
 CARM_PATH = "/World/CArm"
 # CARM_ROTATION_DEG can be set in the global scope before injecting this
-# script, or via the (host) env var if the injector forwards it.
-ANGLE_DEG = float(globals().get("CARM_ROTATION_DEG", os.environ.get("CARM_ROTATION_DEG", 0)))
+# script.  Use .pop() so a value set by a previous TCP call doesn't leak
+# into the next invocation (Isaac Sim's executor keeps persistent globals).
+ANGLE_DEG = float(globals().pop("CARM_ROTATION_DEG",
+                                 os.environ.get("CARM_ROTATION_DEG", 0)))
 
 stage = omni.usd.get_context().get_stage()
 up_axis = (stage.GetMetadata("upAxis") or "Y").upper()

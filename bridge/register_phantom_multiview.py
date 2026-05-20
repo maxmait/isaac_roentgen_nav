@@ -175,16 +175,24 @@ def main() -> int:
         gt_translation_mm = [0.0, 0.0, 0.0]
         print("No pose.json — synthetic mode, GT translation = (0, 0, 0).")
 
-    # Optionally read the C-arm rotation from pose.json — when set, the
-    # AP angle becomes the C-arm's actual rotation in the scene.
+    # Optionally read the C-arm rotation from pose.json.  Two modes:
+    #   - `view_angles_deg` (list)        → use the list directly as views
+    #     (preferred — set by capture_two_shots.py when the user records
+    #     two distinct C-arm orientations).
+    #   - `carm_rotation_y_deg` (scalar)  → single AP angle; auto-derive
+    #     lateral as AP + 90°.
     view_angles = VIEWS_DEG_Y
     if USE_CARM_ROTATION and POSE_FILE.exists():
         with open(POSE_FILE) as f:
             _pose = json.load(f)
-        if "carm_rotation_y_deg" in _pose:
+        if "view_angles_deg" in _pose and len(_pose["view_angles_deg"]) >= 2:
+            view_angles = tuple(float(a) for a in _pose["view_angles_deg"])
+            print(f"USE_CARM_ROTATION=1: view_angles_deg from pose.json = "
+                  f"{[f'{a:+.1f}' for a in view_angles]}°")
+        elif "carm_rotation_y_deg" in _pose:
             base = float(_pose["carm_rotation_y_deg"])
             view_angles = (base, base + 90.0)
-            print(f"USE_CARM_ROTATION=1: AP angle from C-arm prim = {base:+.1f}°  "
+            print(f"USE_CARM_ROTATION=1: single-shot AP = {base:+.1f}°  "
                   f"-> views (ry) = {view_angles}")
 
     views = [
