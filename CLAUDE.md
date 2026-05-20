@@ -45,6 +45,13 @@ using simulated fluoroscopy (DRR) and 2D/3D CT registration — entirely in soft
     isaacsim_client.py             # TCP client for VSCode extension socket (port 8226)
     image_publisher.py             # TCP-injected: ZMQ viewport JPEG stream (port 5556)
     take_snapshot.py               # ZMQ SUB: save one frame from the stream
+    medical_scene.usd              # Phase 5h: OR scene — table, STAR robot, phantom, C-arm
+    inject_medical_scene.py        # TCP-injected: builder for medical_scene.usd contents
+    pose_from_medical_scene.py     # TCP-injected: read live world poses → pose.json
+    add_carm_viz.py                # TCP-injected: build /World/CArm visualisation
+    rotate_carm.py                 # TCP-injected: rotate C-arm around patient long axis
+    add_carm_shot.py               # TCP-injected: append C-arm angle to view_angles_deg
+    capture_two_shots.py           # TCP-injected: timed two-shot capture (GUI manipulator)
     snapshots/                     # runtime viewport snapshots (gitignored)
   bridge/                          # fluorosim side (Docker-bound scripts + wrappers)
     fluorosim_render.py            # runs INSIDE the container; reads pose.json, renders DRR
@@ -351,11 +358,57 @@ needing a separate GUI session.
       EE at (0.72, 15.39, -2.91) mm in anatomy frame, local μ=0.0225 mm⁻¹
       → tool tip in soft tissue, anatomically consistent with a position
       just anterior to the vertebral body.
+- [x] Phase 5h — surgical scene + end-to-end pipeline on a saved USD stage.
+      scenes/medical_scene.usd is a hand-built operating room: walls/floor +
+      lights + Operating_table (UsdGeom) + RobotBase cube + STAR robot
+      (i4h-assets STAR + endo360 tool) + CT spine mesh /World/Phantom/SpineMesh
+      on the table.  Y-up, 1 unit = 1 cm — diverges from the Z-up Franka world
+      that robot_scene.py uses, so a separate ingestion script is needed
+      (the registration math is frame-agnostic — only pose.json values in
+      metres matter).
+      STAR has UsdPhysics.DriveAPI authored on every revolute joint
+      (stiffness 1e9, damping 1e7, force-type drive) so the arm holds
+      whatever pose the user sets in the GUI without falling under gravity.
+      scenes/pose_from_medical_scene.py is TCP-injected to extract live
+      world-frame poses from the open stage and write pose.json in metres —
+      no full Isaac Sim launch needed for the registration loop.
+      End-to-end: pose robot in GUI → inject pose script → run register →
+      compute_robot_to_anatomy.py.  World ||err|| = 0.096 mm.
+- [x] Phase 5i — C-arm USD visualisation + angle-driven DRR view.
+      scenes/add_carm_viz.py builds /World/CArm: source cube + detector
+      plate + arc + beam-axis line, sized to fluorosim's SDD=1020 mm /
+      SID=510 mm so the GUI geometry matches the math.  Source/detector
+      sit on the local Y axis; rotating the C-arm xform around the patient
+      long axis (world Z in Y-up scenes) sweeps source and detector around
+      the patient — clinically correct AP→oblique→lateral motion.
+      scenes/rotate_carm.py rotates the C-arm by a given angle around the
+      patient long axis; scenes/pose_from_medical_scene.py extracts that
+      angle from the C-arm world quaternion and writes it as
+      `carm_rotation_y_deg` (legacy field name).
+      bridge/register_phantom_multiview.py with USE_CARM_ROTATION=1 reads
+      the angle and uses it as the AP view; lateral = AP + 90°.
+- [x] Phase 5j — two-shot / N-shot C-arm capture workflow.
+      Two scripts cover both interaction modes:
+        scenes/capture_two_shots.py    — timed (~3 s wait between shots),
+          pumps the Isaac Sim event loop so the GUI manipulator stays
+          responsive during the wait window.  Useful for GUI-driven flows.
+        scenes/add_carm_shot.py        — append-one-shot, called once per
+          C-arm pose; RESET_SHOTS=1 on the first call clears the list.
+          Best for command-line / scriptable workflows.
+      Either script writes `view_angles_deg: [...]` to pose.json.
+      bridge/register_phantom_multiview.py with USE_CARM_ROTATION=1 reads
+      that list directly — no auto +90° lateral.  Tested with views
+      [0°, 60°] and [0°, 90°]: 0.096–0.106 mm world error.
 - [ ] 6-DOF (translation + rotation) registration — when this lands, plug the
       recovered phantom rotation into compute_robot_to_anatomy.py's phantom_W_rec
-- [ ] Surgical scene environment — operating table USD asset, robot platform
-      next to the table, the CT phantom on the table.  Cosmetic only — the
-      pipeline math is already closed.
+- [ ] Tool in the registration target image — currently the registration
+      renders its target DRR *without* the EE blob (see "Simulation
+      simplifications" in Known Issues).  Adding the tool requires either
+      a tool-masking loss or robust matching; deferred.
+- [ ] Blind optimiser init — currently the optimiser starts at
+      `gt_translation_mm + INIT_OFFSET_MM` (simulating a planning prior
+      with ~20 mm noise).  A stricter "init from carm_pos only" would be
+      truly independent of GT; deferred.
 
 ### Phase 6: Neural Network Acceleration 🔲 (optional/future)
 - [ ] Generate training dataset: random poses → DRR pairs
@@ -423,6 +476,13 @@ needing a separate GUI session.
 | 2026-05-19 | Phase 5e: bridge/ct_to_mesh.py + USD UsdGeom.Mesh in robot_scene.py | ✅ Marching cubes on cached μ-volume → 238k verts / 473k faces OBJ + numpy sidecars. robot_scene.py loads mesh into /World/Phantom/Mesh; falls back to ellipsoid if absent. Verified visually via TCP injection (snapshots/ct_mesh_only.jpg) |
 | 2026-05-19 | Phase 5f: USE_POSE_JSON=1 closure on the CT             | ✅ Mesh isocenter at PHANTOM_POS_WORLD_M = synthetic isocenter, so same pose.json contract applies. End-to-end test: 0.096 mm world err on CT phantom. EE at (0.72, 15.4, -2.9) mm in anatomy frame, local μ=0.0225 → soft tissue (correct anatomically) |
 | 2026-05-19 | compute_robot_to_anatomy.py: data-driven inside/outside check | ✅ μ-volume lookup replaces ellipsoid distance check when CT cache exists. Layout PNG now shows axial+coronal CT slices through isocenter (replaces ellipse drawings). Ellipsoid fallback preserved for synthetic phantom |
+| 2026-05-19 | Phase 5g: tool-in-DRR on the real CT via run_fluorosim.sh | ✅ Added DICOM_PATH switch to fluorosim_render.py + wrapper; renders the spine CT with the EE blob painted in. Visualisation-only path (NOT the registration target — see Phase 5j note) |
+| 2026-05-20 | Phase 5h: medical_scene.usd + STAR drives + pose_from_medical_scene.py | ✅ Hand-built OR (Y-up, cm units) with STAR robot, operating table, CT spine mesh. STAR holds rest pose via authored joint drives (stiff=1e9, damp=1e7). pose_from_medical_scene.py TCP-injects to write pose.json from the live stage. End-to-end: 0.096 mm world err. |
+| 2026-05-20 | Phase 5i: /World/CArm visualisation + angle-driven view  | ✅ add_carm_viz.py builds the C-arm prim (source/detector/arc/beam) at fluorosim's SDD=1020 / SID=510 geometry. rotate_carm.py rotates around patient long axis (world Z in this Y-up scene) so source and detector sweep correctly. USE_CARM_ROTATION=1 makes the registration AP-view follow the C-arm angle. Verified at 0°/45°: source visibly swings; registration converges to 0.05-0.10 mm. |
+| 2026-05-20 | Bug: rotation around scene up-axis didn't move source/det  | ❌ Initial rotate_carm.py rotated around Y (the source/detector axis itself), so they stayed put while only the arc swung. Fixed: rotation axis = patient long axis (perpendicular to scene up). |
+| 2026-05-20 | Phase 5j: two-shot / N-shot C-arm capture                | ✅ Two ingest paths: capture_two_shots.py (timed wait + GUI manipulator) and add_carm_shot.py (append-one-shot, command-line friendly). Both write `view_angles_deg` list to pose.json; registration uses it directly. Tested at [0°, 60°] and [0°, 90°]. |
+| 2026-05-20 | Bug: stale globals in Isaac Sim TCP executor              | ❌ Executor keeps a persistent globals dict across TCP injections. `RESET_SHOTS=1` set in one call leaked into every subsequent call, causing each append to reset the list. Fixed: changed globals.get() → globals.pop() in rotate_carm.py / add_carm_shot.py / capture_two_shots.py. |
+| 2026-05-20 | Bug: TCP commands serialise during sleep                  | ⚠️ time.sleep in a TCP-injected script blocks the executor — concurrent rotate_carm.py via another TCP injection queues behind it. Workaround: capture_two_shots.py pumps the event loop with app.update() during the wait so the *GUI manipulator* stays responsive, but TCP rotations still queue. add_carm_shot.py avoids this entirely. |
 
 ---
 
@@ -577,6 +637,70 @@ Commands (in order):
   resolves against the mounted /workspace/ct_loader.py. Without this, Python
   only finds ct_loader if cwd happens to be /workspace.
 
+### Medical scene (Phases 5h–5j)
+
+- scenes/medical_scene.usd is **Y-up, 1 unit = 1 cm** — different from
+  robot_scene.py's Z-up / 1 unit = 1 m world.  Always convert via
+  `metersPerUnit` when reading prim translations.  pose_from_medical_scene.py
+  and add_carm_shot.py do this automatically.
+- The medical scene's STAR robot only holds pose when the joint drives
+  are present.  Drives are AUTHORED in medical_scene.usd, so they survive
+  save+load.  If the robot ever starts falling under gravity again, the
+  drives have been lost — re-apply via the inline script in
+  scenes/inject_medical_scene.py / Phase 5h commit history.
+- Patient long axis in medical_scene.usd is **world Z** (the table's long
+  edge runs along Z; the spine mesh's "head-feet" axis aligns with Z).
+  C-arm rotation around world Z = LAO/RAO sweep — this is what
+  rotate_carm.py and pose_from_medical_scene.py extract.  If you ever
+  re-author the scene with a different patient orientation, update the
+  PATIENT_LONG_AXIS map in those two scripts.
+- TCP injections in Isaac Sim **serialise** — a TCP command issued while
+  another is executing waits for the first to finish.  This means
+  rotate_carm.py via TCP cannot be used to rotate the C-arm DURING a
+  capture_two_shots.py wait — they queue.  Workarounds: rotate via the
+  GUI manipulator (direct USD edit, no TCP), or use add_carm_shot.py
+  (one shot per call, no waiting).
+- The Isaac Sim TCP executor keeps a **persistent globals dict** across
+  calls.  Any parameter passed via `globals()` (e.g. `CARM_ROTATION_DEG`,
+  `RESET_SHOTS`, `TWO_SHOT_WAIT_SEC`) must be consumed with
+  `globals().pop(...)` not `globals().get(...)` — otherwise the value
+  leaks into every subsequent injection.
+
+### Simulation simplifications (honest about what's not real)
+
+Two known places where the simulation is more permissive than a clinical
+setting.  Both are deferred fixes — listed in the Phase 5 checklist as
+unchecked items:
+
+1. **Tool not in the registration target image**.  `fluorosim_render.py`
+   (run by `run_fluorosim.sh`) paints the EE blob into the μ-volume → its
+   DRR shows the tool, matching a real fluoroscope.  But
+   `register_phantom_multiview.py` builds its target images from the
+   clean μ-volume — *no tool*.  Reason: μ=0.5 mm⁻¹ is ~28× cortical bone,
+   so an opaque blob occludes the spine and dominates the MSE loss.
+   Real-world fluoroscopy registration handles this by masking the tool
+   region or using a robust loss.  To make our simulation stricter, we'd
+   need to either paint the tool into the target AND add a mask/robust
+   loss, or accept that the tool is "known geometry" the registration
+   subtracts before matching.
+
+2. **Optimizer init uses GT + INIT_OFFSET_MM**.  In
+   register_phantom_multiview.py:
+       init_trans = gt_translation_mm + INIT_OFFSET_MM
+   The 20 mm offset simulates pre-op planning error, but the chain reads
+   the ground truth to construct the starting pose.  Once the optimiser
+   is running it only sees the target image — but the *capture range*
+   (how far off you can start and still converge) is hidden behind this
+   prior.  A stricter "blind init from carm_pos" (treating the phantom
+   as roughly at the C-arm isocenter — the standard clinical assumption)
+   would be independent of GT but might fail to converge if the actual
+   phantom is too far from isocenter.  Worth doing as a separate
+   characterisation experiment.
+
+In both cases the registration ALGORITHM is identical to what would be
+used clinically.  The simplifications affect *how realistic the input
+is*, not *whether the math works*.
+
 ---
 
 ## Key Commands
@@ -654,6 +778,39 @@ DICOM_PATH=~/medical_imaging/spine_mets_ct_seg/10250/04098/27242 \
 # Same flags work for the single-view script:
 DICOM_PATH=~/medical_imaging/spine_mets_ct_seg/10250/04098/27242 \
   USE_POSE_JSON=0 ~/isaac_projects/bridge/run_register.sh
+
+# === Phases 5h-5j: medical scene end-to-end ===
+# (Open Isaac Sim GUI with scenes/medical_scene.usd loaded first.)
+
+# Rotate the C-arm to a specific angle around the patient long axis
+python3 ~/isaac_projects/scenes/isaacsim_client.py "CARM_ROTATION_DEG=45
+$(cat ~/isaac_projects/scenes/rotate_carm.py)"
+
+# Workflow A (command-line, recommended): two-shot capture
+python3 ~/isaac_projects/scenes/isaacsim_client.py "CARM_ROTATION_DEG=0
+$(cat ~/isaac_projects/scenes/rotate_carm.py)"
+python3 ~/isaac_projects/scenes/isaacsim_client.py "RESET_SHOTS=1
+$(cat ~/isaac_projects/scenes/add_carm_shot.py)"
+python3 ~/isaac_projects/scenes/isaacsim_client.py "CARM_ROTATION_DEG=90
+$(cat ~/isaac_projects/scenes/rotate_carm.py)"
+python3 ~/isaac_projects/scenes/isaacsim_client.py < ~/isaac_projects/scenes/add_carm_shot.py
+
+# Workflow B (GUI): timed capture — drag the manipulator during the wait
+python3 ~/isaac_projects/scenes/isaacsim_client.py "TWO_SHOT_WAIT_SEC=5
+$(cat ~/isaac_projects/scenes/capture_two_shots.py)"
+
+# Either workflow ends with pose.json containing view_angles_deg = [...]
+# Run multi-view registration using those captured views:
+DICOM_PATH=~/medical_imaging/spine_mets_ct_seg/10250/04098/27242 \
+  USE_POSE_JSON=1 USE_CARM_ROTATION=1 \
+  ~/isaac_projects/bridge/run_register_multiview.sh
+
+# Run T_robot_to_anatomy + clinical inside/outside check
+python3 ~/isaac_projects/bridge/compute_robot_to_anatomy.py
+
+# Render a single demo DRR (with the EE tool painted in — for visualisation)
+DICOM_PATH=~/medical_imaging/spine_mets_ct_seg/10250/04098/27242 \
+  ~/isaac_projects/bridge/run_fluorosim.sh
 
 # Build the derived torch-enabled image (one-time, ~5 min for the wheel download)
 docker build -t fluorosim-torch -f ~/isaac_projects/bridge/fluorosim_torch.Dockerfile \
