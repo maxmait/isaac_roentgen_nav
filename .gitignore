@@ -27,3 +27,7 @@ Thumbs.db
 # Listed here in case they ever get re-cloned in-tree.
 /i4h-sensor-simulation/
 /i4h-workflows/
+
+# Local scene editing artifacts
+scenes/.thumbs/
+scenes/medical_scene copy.usd
