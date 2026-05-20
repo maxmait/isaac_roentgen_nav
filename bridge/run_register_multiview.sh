@@ -32,7 +32,7 @@ fi
 mkdir -p "${HOST_IO_DIR}/registration_multiview"
 
 DOCKER_ENV_ARGS=()
-for v in VIEWS_DEG_Y INIT_OFFSET_MM LR_MM N_ITERS LOG_EVERY USE_POSE_JSON CT_FULL_VOLUME CT_CROP_CENTER_ZYX; do
+for v in VIEWS_DEG_Y INIT_OFFSET_MM LR_MM N_ITERS LOG_EVERY USE_POSE_JSON USE_CARM_ROTATION CT_FULL_VOLUME CT_CROP_CENTER_ZYX; do
     if [[ -n "${!v:-}" ]]; then
         DOCKER_ENV_ARGS+=("-e" "${v}=${!v}")
     fi

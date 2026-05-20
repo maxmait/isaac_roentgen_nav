@@ -84,6 +84,12 @@ def _env_views_deg(default: tuple[float, ...]) -> tuple[float, ...]:
 # 60° oblique pair. Override via VIEWS_DEG_Y="0,90" (default), "0,45,90", etc.
 VIEWS_DEG_Y: tuple[float, ...] = _env_views_deg((0.0, 90.0))
 
+# When USE_CARM_ROTATION=1 and pose.json contains carm_rotation_y_deg, treat
+# that angle (the C-arm prim's rotation around the scene's up axis) as the
+# AP view, with lateral = AP + 90°.  This lets the GUI C-arm pose drive the
+# DRR view direction.
+USE_CARM_ROTATION = bool(int(os.environ.get("USE_CARM_ROTATION", "0")))
+
 INIT_OFFSET_MM = _envv("INIT_OFFSET_MM", (15.0, -10.0, 8.0))
 LR_MM = _envf("LR_MM", 1.0)
 N_ITERS = int(_envf("N_ITERS", 100))
@@ -169,10 +175,22 @@ def main() -> int:
         gt_translation_mm = [0.0, 0.0, 0.0]
         print("No pose.json — synthetic mode, GT translation = (0, 0, 0).")
 
+    # Optionally read the C-arm rotation from pose.json — when set, the
+    # AP angle becomes the C-arm's actual rotation in the scene.
+    view_angles = VIEWS_DEG_Y
+    if USE_CARM_ROTATION and POSE_FILE.exists():
+        with open(POSE_FILE) as f:
+            _pose = json.load(f)
+        if "carm_rotation_y_deg" in _pose:
+            base = float(_pose["carm_rotation_y_deg"])
+            view_angles = (base, base + 90.0)
+            print(f"USE_CARM_ROTATION=1: AP angle from C-arm prim = {base:+.1f}°  "
+                  f"-> views (ry) = {view_angles}")
+
     views = [
         {"name": view_name(a), "angle_deg": a,
          "rotation_rad": (0.0, math.radians(a), 0.0)}
-        for a in VIEWS_DEG_Y
+        for a in view_angles
     ]
     print(f"Views (ry angles, deg): {[v['angle_deg'] for v in views]}  "
           f"-> names: {[v['name'] for v in views]}")
