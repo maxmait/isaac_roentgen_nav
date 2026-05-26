@@ -2,28 +2,29 @@
 
 Fluoroscopy-guided robot pose estimation in Isaac Sim. A virtual surgical scene
 with a STAR robot and a CT spine phantom is imaged by a simulated mobile
-C-arm; differentiable DRR registration recovers the anatomy pose from the
-X-ray images; the recovered pose is composed with the robot's forward
-kinematics to produce **T_robot_in_anatomy** — the transform that
-intraoperative trajectory planning would consume.
+C-arm; differentiable DRR registration recovers the anatomy pose (position
+**and** orientation) from the X-ray images; the recovered pose is composed with
+the robot's forward kinematics to produce **T_robot_in_anatomy** — the transform
+that intraoperative trajectory planning would consume.
 
 | Surgical scene (STAR + CT spine + C-arm) | Simulated fluoroscopy with tool blob |
 |---|---|
 | ![Medical scene](docs/images/medical_scene_overview.jpg) | ![DRR with tool](docs/images/medical_scene_drr_with_tool.png) |
 
 The C-arm rotation in the scene drives the registration view direction —
-position robot and C-arm in the GUI, capture two (or more) C-arm angles
-as separate shots, and the multi-view registration uses them directly.
-See the [Quick start](#quick-start--full-end-to-end) below.
+position robot and C-arm in the GUI, capture two (or more) C-arm angles as
+separate shots, and the multi-view 6-DOF registration recovers both translation
+and phantom orientation from those shots. See the [Quick start](#quick-start--full-end-to-end) below.
 
-**Headline results** — multi-view registration on the real spine CT, sub-mm:
+**Headline results** — 6-DOF multi-view registration on the real spine CT:
 
-| Volume / scene | Error ‖err‖ | Time |
-|---|---|---|
-| Synthetic ellipsoid + Franka rest pose | **0.05 mm** | ~10 s |
-| Real spine CT — cropped 128 mm³ ROI | **0.037 mm** | 9.4 s |
-| Real spine CT — full 797×512×512 scan | **0.076 mm** | 15.6 s |
-| Medical scene (STAR + spine on table) — two shots [0°, 90°] | **0.096 mm** | ~10 s |
+| Volume / scene | Trans ‖err‖ | Rot ‖err‖ | Time |
+|---|---|---|---|
+| Synthetic ellipsoid + Franka rest pose | **0.07 mm** | — (symmetric, no signal) | ~8 s |
+| Real spine CT — cropped 128 mm³ ROI (3-DOF) | **0.037 mm** | — | 9.4 s |
+| Real spine CT — 6-DOF, 200 iters | **0.016 mm** | **0.020°** | 15.2 s |
+| Real spine CT — full 797×512×512 (3-DOF) | **0.076 mm** | — | 15.6 s |
+| Medical scene (STAR + spine on table) | **0.096 mm** | — | ~10 s |
 
 All on an RTX 4060 Laptop GPU (8 GB VRAM). The full CT volume fits with room to spare.
 
@@ -49,27 +50,27 @@ composition) maps directly to its real-OR counterpart.
 
 ```
    ┌──────────────────────────────────────────────┐
-   │  Isaac Sim  (host, headless)                  │
+   │  Isaac Sim  (host, headless or GUI)           │
    │                                              │
-   │  Franka arm ─── FK ──► ee_pos, ee_quat       │
-   │  Phantom    ─── USD ──► phantom_pos           │
-   │  C-arm      ─── set ──► carm_pos              │
+   │  Robot arm  ─── FK ──► ee_pos, ee_quat        │
+   │  Phantom    ─── USD ──► phantom_pos, quat     │
+   │  C-arm      ─── GUI ──► shot angles list      │
    │                                              │
-   │  → pose.json  (written each sim step)         │
+   │  → pose.json  (written per step or on demand) │
    └──────────────────┬───────────────────────────┘
                       │
                       ▼
    ┌──────────────────────────────────────────────┐
    │  fluorosim  (Docker, GPU)                    │
    │                                              │
-   │  ➊  Paint robot tool into μ-volume           │
-   │  ➋  Render AP DRR  (C-arm rotation = 0°)     │
-   │  ➌  Rotate gantry 90°                        │
-   │  ➍  Render lateral DRR                       │
-   │  ➎  Multi-view registration                  │
-   │       single shared translation parameter    │
-   │       summed MSE + Slang autodiff + Adam      │
-   │  → recovered phantom_pos (world frame)        │
+   │  ➊  Render target DRR per captured C-arm angle │
+   │  ➋  6-DOF optimizer (Adam):                  │
+   │       shared translation  (3 DOF, mm)        │
+   │       shared phantom_rot  (3 DOF, ZXY Euler) │
+   │       per-view: t_eff = R_ph.T @ t_world     │
+   │                 R_eff = R_ph.T @ R_gantry    │
+   │       summed MSE · Slang autodiff · Adam      │
+   │  → recovered phantom_pos + phantom_quat       │
    └──────────────────┬───────────────────────────┘
                       │
                       ▼
@@ -78,7 +79,7 @@ composition) maps directly to its real-OR counterpart.
    │                                              │
    │  T_R^W  ← ee_pos / ee_quat  (FK, always known) │
    │  T_C^W  ← carm_pos / quat   (calibration)    │
-   │  T_A^W  ← registered phantom_pos             │
+   │  T_A^W  ← registered phantom_pos + quat      │
    │                                              │
    │  T_R^A = inv(T_A^W) · T_R^W                   │
    │  T_R^C, T_A^C   (all three transforms)       │
@@ -88,9 +89,9 @@ composition) maps directly to its real-OR counterpart.
 
 `pose.json` carries every world-frame pose (EE, C-arm, phantom) as the IPC
 contract between Isaac Sim and the fluorosim container. The registration
-recovers `translation_mm = (carm_pos − phantom_pos) × 1000`, which is the
-C-arm position in the volume-local frame — the real unknown in any
-fluoroscopy-guided procedure.
+recovers `translation_mm = (carm_pos − phantom_pos) × 1000` and
+`phantom_rot` (ZXY Euler), which together give the full 6-DOF anatomy pose
+relative to the C-arm — the real unknown in any fluoroscopy-guided procedure.
 
 ---
 
@@ -108,8 +109,8 @@ two roles that are easy to conflate but are distinct:
 | `compute_robot_to_anatomy.py` compares GT vs recovered | Accuracy scoring | An independent precision measurement (optical tracker, CMM) — present only for evaluation |
 
 The optimizer never reads `phantom_pos`. It sees only the CT μ-volume, the
-two target images, and an initial translation guess. Convergence to 50 µm is
-recovery from the images alone.
+target images, and an initial translation guess. Convergence to 16 µm / 0.02°
+is recovery from the images alone.
 
 Full input audit:
 
@@ -117,15 +118,11 @@ Full input audit:
 |---|---|---|---|
 | Robot EE pose | Isaac Sim FK | Joint encoders → FK | ✓ |
 | C-arm pose | Set in `pose.json` | Hand-eye calibration C-arm ↔ robot (one-time) | ✓ |
-| C-arm gantry angle per shot | Hardcoded 0° / 90° | Gantry encoders | ✓ |
+| C-arm gantry angle per shot | Captured from USD prim | Gantry encoders | ✓ |
 | CT μ-volume | Real DICOM spine CT or synthetic cache | Pre-op CT, segmented HU→μ | ✓ (mechanism identical) |
 | Target X-ray | Rendered by fluorosim | Actual X-ray photons | ✓ (same Beer–Lambert physics) |
 | Optimizer initial guess | `gt + INIT_OFFSET_MM` | Planning prior or "anatomy at isocenter" | ⚠ uses GT as basis for testing; easily replaced with a fixed prior |
 | Ground-truth phantom pose (for scoring) | `pose.json` | Sim-only — NOT used by the optimizer | Validation reference only |
-
-One note on coordinate frames: Isaac Sim uses an arbitrary world frame, but
-the Franka sits at the origin, so world ≡ robot-base here. In a real OR
-everything would be expressed in robot-base frame using the same math.
 
 ---
 
@@ -137,9 +134,9 @@ everything would be expressed in robot-base frame using the same math.
 ## Software stack
 
 - **Isaac Sim 4.5.0** (standalone at `~/isaacsim/`)
-- **fluorosim** (NVIDIA i4h-sensor-simulation) in its own Docker image
+- **fluorosim** (NVIDIA i4h-sensor-simulation) — differentiable DRR renderer
 - **fluorosim-torch** — derived image (`bridge/fluorosim_torch.Dockerfile`)
-  adding PyTorch for the differentiable registration
+  adding PyTorch 2.5.1+cu121 for the registration optimizer
 - Host-side Python: `numpy`, `matplotlib`, `pyzmq`, `Pillow` — see
   [`pyproject.toml`](pyproject.toml)
 
@@ -192,9 +189,9 @@ python3 scenes/isaacsim_client.py "CARM_ROTATION_DEG=90
 $(cat scenes/rotate_carm.py)"
 python3 scenes/isaacsim_client.py < scenes/add_carm_shot.py
 
-# Multi-view registration uses both captured C-arm angles
+# 6-DOF multi-view registration (200 iters for full accuracy)
 DICOM_PATH=~/medical_imaging/spine_mets_ct_seg/10250/04098/27242 \
-  USE_POSE_JSON=1 USE_CARM_ROTATION=1 \
+  USE_POSE_JSON=1 USE_CARM_ROTATION=1 N_ITERS=200 \
   bridge/run_register_multiview.sh
 
 # Compose T_robot_in_anatomy + inside-bone clinical check
@@ -207,14 +204,14 @@ DICOM_PATH=~/medical_imaging/spine_mets_ct_seg/10250/04098/27242 \
 
 ### Workflow B — headless smoke test (Franka + synthetic phantom)
 
-The original Z-up world without an OR around it.  Useful for regression
+The original Z-up world without an OR around it. Useful for regression
 testing the pipeline math without GUI involvement.
 
 ```bash
 # Step 1 — build the simulated scene and write pose.json (~25 s)
 ~/isaacsim/python.sh scenes/robot_scene.py
 
-# Step 2 — sequential AP + lateral registration (~10 s)
+# Step 2 — sequential AP + lateral registration (~8 s, 3-DOF default)
 bridge/run_register_multiview.sh
 
 # Step 3 — compose T_robot_in_anatomy from registration + FK
@@ -267,41 +264,53 @@ ambiguity). The 90° lateral shot collapses it:
 Z is the *most-constrained* axis with two views because it is in-plane in the
 lateral view and its gradient is strong there.
 
-![Registration convergence](docs/images/registration_multiview_convergence.png)
-![Registration Multiview](docs/images/registration_multiview_image.png)
+### 6-DOF registration — translation + rotation
 
-### Real CT results
+The optimizer jointly recovers phantom translation and orientation (3 + 3 DOF)
+using a shared `phantom_rot` (ZXY Euler) parameter. Per-view composition
+ensures each rendered DRR uses the correct effective viewing angle through the
+rotated anatomy. The rotation backward path in Slang's autodiff produces NaN
+in some configurations; these are detected and zeroed out so the optimizer
+continues cleanly.
 
-The same multi-view registration runs against a real 797-slice spine CT
-(`bridge/ct_loader.py` + `DICOM_PATH` env var):
+On the real spine CT with `N_ITERS=200` (needed to untangle the
+rotation-translation coupling):
 
-| CT mode | Volume | ‖err‖ | ms/iter |
-|---|---|---|---|
-| Cropped ROI | (128,256,256) @ 1×0.5×0.5 mm | **0.037 mm** | 95 ms |
-| Full volume | (797,512,512) @ 0.5×0.7×0.7 mm | **0.076 mm** | 156 ms |
+| | Init | Final |
+|---|---|---|
+| Translation ‖err‖ | 19.7 mm | **0.016 mm** |
+| Rotation ‖err‖ (geodesic) | 5.83° | **0.020°** |
+| Wall time | — | 15.2 s (76 ms/iter) |
 
-Both fit within 8 GB VRAM. The cropped-ROI path gives better accuracy
-(the FOV sees only bone; every gradient step is informative); the full-volume
-path requires no resampling and produces realistic torso DRRs.
+![6-DOF convergence (4 panels)](docs/images/registration_6dof_convergence.png)
 
-### Medical scene — angle-driven multi-view DRRs
+*Left to right: total MSE loss, per-view loss (AP / lateral), translation error
+per axis, rotation error per axis. The optimizer oscillates until ~iter 120 as
+rotation and translation untangle, then converges sharply.*
 
-With `medical_scene.usd` loaded and two C-arm shots captured at 0° and 90°
-around the patient long axis, the multi-view registration uses those two
-angles directly as the view list (`USE_CARM_ROTATION=1`):
+![6-DOF DRR comparison](docs/images/registration_6dof_images.png)
 
-![Multi-view DRRs on medical scene](docs/images/registration_multiview_medical.png)
+*AP (top) and lateral (bottom): target | recovered | |diff|. The |diff| max of
+0.015 (AP) and 0.010 (lateral) is near the noise floor of the differentiable
+renderer.*
 
-Top row: AP (ry = 0°). Bottom row: lateral (ry = 90°). Left → target,
-middle → recovered after optimisation, right → |diff|. World error
-0.096 mm. Rotating the C-arm in the GUI and recapturing both shots
-re-runs the registration from the new view directions.
+### T_robot_in_anatomy — end-to-end on a real Isaac Sim scene
+
+```
+T_robot_in_anatomy.t  (mm)
+         Ground truth:  [  0.623,  15.397,  -2.932 ]
+            Recovered:  [  0.659,  15.363,  -2.919 ]
+     Per-axis error:    [  0.036,  -0.033,   0.013 ]
+         ‖error‖:       0.051 mm
+
+Clinical: Tool tip is INSIDE the bone core (normalized distance 0.77).
+```
 
 ### Simulation simplifications (honest about what's not real)
 
 Two known places where the simulation is more permissive than a clinical
 setting. They do not change the registration algorithm — only the input
-realism — and are listed as future-work items:
+realism:
 
 1. **The registration's target DRR does not include the robot tool.**
    The demo DRR (`bridge/run_fluorosim.sh`, the image at the top of this
@@ -320,22 +329,6 @@ realism — and are listed as future-work items:
    A stricter "blind init from C-arm isocenter only" is independent of
    GT and a worthwhile follow-up experiment.
 
-Both registration loop steps are identical to what a clinical implementation
-would use. These simplifications affect *how realistic the input is*, not
-*whether the math works*.
-
-### End-to-end result on a real Isaac Sim scene
-
-```
-T_robot_in_anatomy.t  (mm)
-         Ground truth:  [  0.623,  15.397,  -2.932 ]
-            Recovered:  [  0.659,  15.363,  -2.919 ]
-     Per-axis error:    [  0.036,  -0.033,   0.013 ]
-         ‖error‖:       0.051 mm
-
-Clinical: Tool tip is INSIDE the bone core (normalized distance 0.77).
-```
-
 ---
 
 ## Project layout
@@ -345,7 +338,7 @@ isaac_roentgen_nav/
 ├── scenes/                            # Isaac Sim — scene scripts + host tooling
 │   ├── robot_scene.py                 # headless: Franka + phantom, writes pose.json
 │   ├── phantom.py                     # shared phantom geometry (single source of truth)
-│   ├── medical_scene.usd              # Phase 5h: OR scene — table, STAR, phantom, C-arm
+│   ├── medical_scene.usd              # OR scene — table, STAR, CT spine, C-arm
 │   ├── inject_medical_scene.py        # TCP-injected: builder for medical_scene.usd
 │   ├── pose_from_medical_scene.py     # TCP-injected: live stage → pose.json (metres)
 │   ├── add_carm_viz.py                # TCP-injected: build /World/CArm visualisation
@@ -362,12 +355,12 @@ isaac_roentgen_nav/
 │   ├── run_fluorosim.sh               # docker run wrapper
 │   ├── visualize_drr.py               # host: annotated viewer + sanity check
 │   ├── fluorosim_torch.Dockerfile     # fluorosim + PyTorch 2.5.1+cu121
-│   ├── register_phantom.py            # single-view translation registration
+│   ├── register_phantom.py            # single-view 6-DOF registration
 │   ├── run_register.sh                # wrapper for single-view
 │   ├── plot_registration.py           # host: single-view convergence plots
-│   ├── register_phantom_multiview.py  # sequential AP + lateral registration
+│   ├── register_phantom_multiview.py  # multi-view 6-DOF registration (primary)
 │   ├── run_register_multiview.sh      # wrapper for multi-view
-│   ├── plot_registration_multiview.py # host: per-view losses + image grid
+│   ├── plot_registration_multiview.py # host: 4-panel convergence + image grid
 │   ├── compute_robot_to_anatomy.py    # host: registration → T_R^A, T_R^C, T_A^C
 │   ├── ct_loader.py                   # DICOM CT → PreprocessedVolume (cropped or full)
 │   └── run_load_ct.sh                 # one-time CT cache builder
@@ -396,38 +389,27 @@ isaac_roentgen_nav/
   end-to-end test on a live Isaac Sim scene
 - **Phase 5d** — Real DICOM CT integration: `bridge/ct_loader.py` loads a
   797-slice spine CT via SimpleITK; `DICOM_PATH` + `CT_FULL_VOLUME` env vars
-  select real CT vs synthetic and cropped vs full volume. Multi-view
-  registration on the real CT converges to **~0.1 mm** ‖err‖ in both modes,
-  within 8 GB VRAM
-- **Phase 5e** — Isaac Sim CT mesh: `bridge/ct_to_mesh.py` extracts a
-  triangle mesh from the cached μ-volume (marching cubes + Laplacian
-  smoothing), `scenes/robot_scene.py` loads it as a `UsdGeom.Mesh` —
-  ellipsoid fallback when the mesh is absent
-- **Phase 5f** — Closed `USE_POSE_JSON=1` loop on the CT phantom.
-  `compute_robot_to_anatomy.py` now does data-driven inside-bone/soft-tissue
-  classification via μ-volume lookup at the EE position; the layout PNG
-  shows actual axial+coronal CT slices through the isocenter
-- **Phase 5g** — Tool-in-DRR on the real CT: `run_fluorosim.sh` accepts
-  `DICOM_PATH`, paints the EE blob into the spine μ-volume, produces a
-  clinical-looking DRR with vertebrae + dark instrument shadow
+  select real CT vs synthetic and cropped vs full volume
+- **Phase 5e** — Isaac Sim CT mesh: `bridge/ct_to_mesh.py` extracts a triangle
+  mesh (marching cubes + Laplacian smoothing), loaded as `UsdGeom.Mesh`
+- **Phase 5f** — `USE_POSE_JSON=1` loop closed on the CT phantom;
+  `compute_robot_to_anatomy.py` does data-driven inside-bone classification via
+  μ-volume lookup; layout PNG shows CT slices through isocenter
+- **Phase 5g** — Tool-in-DRR on the real CT: EE blob painted into spine
+  μ-volume for demo rendering
 - **Phase 5h** — Surgical scene (`scenes/medical_scene.usd`): operating
-  table, STAR robot on a base block, CT spine mesh on the table, lights.
-  STAR has authored joint drives so the arm holds whatever pose the user
-  sets in the GUI. `pose_from_medical_scene.py` TCP-injects to read live
-  world-frame poses from the open stage → pose.json in metres
-- **Phase 5i** — C-arm visualisation (`/World/CArm`) sized to fluorosim's
-  SDD/SID geometry; rotates around the patient long axis (clinically
-  correct AP→oblique→lateral sweep). `USE_CARM_ROTATION=1` makes the
-  registration view follow the C-arm angle
-- **Phase 5j** — Two-shot / N-shot C-arm capture workflow: pose C-arm,
-  call `add_carm_shot.py` (or `capture_two_shots.py`) for each view; the
-  multi-view registration uses the captured list directly. End-to-end
-  test on the medical scene: ~0.1 mm world error
+  table, STAR robot, CT spine mesh; STAR holds pose via authored joint drives
+- **Phase 5i** — C-arm USD visualisation sized to fluorosim SDD/SID geometry;
+  correct AP→lateral sweep around patient long axis
+- **Phase 5j** — Two-shot / N-shot C-arm capture workflow (`add_carm_shot.py`,
+  `capture_two_shots.py`); registration reads the captured angle list directly
+- **Phase 5k** — **6-DOF registration**: jointly optimizes phantom translation
+  (3 DOF) and orientation (3 DOF). On real spine CT: **0.016 mm / 0.020°** in
+  200 iters (15.2 s). Backward-compatible: set `INIT_ROT_DEG="0,0,0"` to
+  revert to 3-DOF translation-only mode
 
 **Next:**
 
-- **6-DOF registration** — extend to translation + rotation (phantom
-  orientation currently assumed identity)
 - **Tool in registration target image + blind init** — see "Simulation
   simplifications" above. Two independent improvements to make the
   fluoroscopy simulation match a clinical setting more strictly.
