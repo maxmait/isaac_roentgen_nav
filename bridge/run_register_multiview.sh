@@ -6,7 +6,9 @@
 # Environment variables (all optional):
 #   VIEWS_DEG_Y     comma-separated LAO/RAO angles in degrees (default "0,90")
 #   INIT_OFFSET_MM  perturbation in fluorosim translation space (default "15,-10,8")
-#   LR_MM           Adam learning rate                          (default 1.0)
+#   INIT_ROT_DEG    perturbation in phantom rotation (ZXY Euler, default "5,0,3")
+#   LR_MM           Adam learning rate for translation          (default 1.0)
+#   LR_ROT_RAD      Adam learning rate for rotation (rad/step)  (default 0.01)
 #   N_ITERS         optimizer iterations                        (default 100)
 #   LOG_EVERY       progress print stride                       (default 5)
 #   USE_POSE_JSON   set to 0 to ignore pose.json                (default 1)
@@ -32,7 +34,7 @@ fi
 mkdir -p "${HOST_IO_DIR}/registration_multiview"
 
 DOCKER_ENV_ARGS=()
-for v in VIEWS_DEG_Y INIT_OFFSET_MM LR_MM N_ITERS LOG_EVERY USE_POSE_JSON USE_CARM_ROTATION CT_FULL_VOLUME CT_CROP_CENTER_ZYX; do
+for v in VIEWS_DEG_Y INIT_OFFSET_MM INIT_ROT_DEG LR_MM LR_ROT_RAD ROT_GRAD_CLIP N_ITERS LOG_EVERY USE_POSE_JSON USE_CARM_ROTATION CT_FULL_VOLUME CT_CROP_CENTER_ZYX; do
     if [[ -n "${!v:-}" ]]; then
         DOCKER_ENV_ARGS+=("-e" "${v}=${!v}")
     fi

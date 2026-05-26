@@ -7,7 +7,9 @@
 # Environment variables (all optional, defaults set in register_phantom.py):
 #   GT_TRANSLATION_MM   ground-truth translation, "x,y,z" in mm (default "0,0,0")
 #   INIT_OFFSET_MM      initial perturbation,     "x,y,z" in mm (default "15,-10,8")
-#   LR_MM               Adam learning rate                       (default 1.0)
+#   INIT_ROT_DEG        rotation perturbation (ZXY Euler deg)    (default "5,0,3")
+#   LR_MM               Adam learning rate for translation       (default 1.0)
+#   LR_ROT_RAD          Adam learning rate for rotation (rad/step)(default 0.01)
 #   N_ITERS             optimizer iterations                     (default 100)
 #   LOG_EVERY           progress print stride                    (default 5)
 #   DICOM_PATH          host path to a DICOM CT dir; when set, use real CT
@@ -33,7 +35,7 @@ mkdir -p "${HOST_IO_DIR}/registration"
 
 # Forward the experiment env vars into the container if set on the host.
 DOCKER_ENV_ARGS=()
-for v in GT_TRANSLATION_MM INIT_OFFSET_MM LR_MM N_ITERS LOG_EVERY CT_FULL_VOLUME CT_CROP_CENTER_ZYX; do
+for v in GT_TRANSLATION_MM INIT_OFFSET_MM INIT_ROT_DEG LR_MM LR_ROT_RAD ROT_GRAD_CLIP N_ITERS LOG_EVERY CT_FULL_VOLUME CT_CROP_CENTER_ZYX; do
     if [[ -n "${!v:-}" ]]; then
         DOCKER_ENV_ARGS+=("-e" "${v}=${!v}")
     fi
