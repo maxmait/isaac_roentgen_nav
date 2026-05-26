@@ -399,8 +399,31 @@ needing a separate GUI session.
       bridge/register_phantom_multiview.py with USE_CARM_ROTATION=1 reads
       that list directly — no auto +90° lateral.  Tested with views
       [0°, 60°] and [0°, 90°]: 0.096–0.106 mm world error.
-- [ ] 6-DOF (translation + rotation) registration — when this lands, plug the
-      recovered phantom rotation into compute_robot_to_anatomy.py's phantom_W_rec
+- [x] Phase 5k — 6-DOF (translation + rotation) registration.
+      bridge/register_phantom_multiview.py and register_phantom.py extended with a
+      shared `phantom_rot` (ZXY Euler, rad) that is jointly optimized alongside
+      `translation`. Two differentiable helpers: euler_zxy_to_matrix (fully
+      differentiable) and matrix_to_euler_zxy (atan2-based — stable Jacobian at
+      ±90°, unlike arcsin which diverges at gimbal lock). Per-view composition:
+      t_eff = R_phantom.T @ t_world, R_eff = R_phantom.T @ R_gantry.
+      Slang autodiff produces NaN for the rotation backward path in some
+      configurations (the rotation-grad code path was never exercised in 3-DOF).
+      Fixed with a NaN guard: if torch.isnan(p.grad).any(): p.grad.zero_().
+      Sign-flip fix (negate grad before optimizer.step) applies to BOTH
+      translation and phantom_rot.
+      New env vars: INIT_ROT_DEG (default "5,0,3"), LR_ROT_RAD (default 0.005),
+      ROT_GRAD_CLIP (default 0.1).
+      Verified on real spine CT at N_ITERS=200: translation 19.7 mm → 0.016 mm,
+      rotation 5.83° → 0.020° (geodesic) in 15.2 s (76 ms/iter).
+      NOTE: 6-DOF needs ~200 iterations to untangle rotation-translation coupling;
+      the default 100 iters leave the optimizer in mid-oscillation (~0.5 mm, ~0.8°).
+      Backward-compatible: with INIT_ROT_DEG="0,0,0" and identity phantom_quat,
+      rotation gradient is ~0 and translation converges identically to 3-DOF.
+      compute_robot_to_anatomy.py updated to use phantom_quat_recovered_wxyz from
+      the trace (falls back to identity when key absent). Rotation error (geodesic)
+      reported in both the JSON output and the text summary.
+      plot_registration_multiview.py extended to 4 panels — 4th shows per-axis
+      rotation error and geodesic norm vs iteration.
 - [ ] Tool in the registration target image — currently the registration
       renders its target DRR *without* the EE blob (see "Simulation
       simplifications" in Known Issues).  Adding the tool requires either
@@ -483,6 +506,9 @@ needing a separate GUI session.
 | 2026-05-20 | Phase 5j: two-shot / N-shot C-arm capture                | ✅ Two ingest paths: capture_two_shots.py (timed wait + GUI manipulator) and add_carm_shot.py (append-one-shot, command-line friendly). Both write `view_angles_deg` list to pose.json; registration uses it directly. Tested at [0°, 60°] and [0°, 90°]. |
 | 2026-05-20 | Bug: stale globals in Isaac Sim TCP executor              | ❌ Executor keeps a persistent globals dict across TCP injections. `RESET_SHOTS=1` set in one call leaked into every subsequent call, causing each append to reset the list. Fixed: changed globals.get() → globals.pop() in rotate_carm.py / add_carm_shot.py / capture_two_shots.py. |
 | 2026-05-20 | Bug: TCP commands serialise during sleep                  | ⚠️ time.sleep in a TCP-injected script blocks the executor — concurrent rotate_carm.py via another TCP injection queues behind it. Workaround: capture_two_shots.py pumps the event loop with app.update() during the wait so the *GUI manipulator* stays responsive, but TCP rotations still queue. add_carm_shot.py avoids this entirely. |
+| 2026-05-26 | Phase 5k: 6-DOF registration (translation + rotation)    | ✅ register_phantom_multiview.py and register_phantom.py extended with shared phantom_rot (ZXY Euler, rad) optimized jointly with translation. Helpers: euler_zxy_to_matrix (differentiable) + matrix_to_euler_zxy (atan2-based, stable at gimbal lock). Sign-flip applies to both params. NaN guard on rotation backward (Slang NaN propagation bug). On real spine CT at N_ITERS=200: 19.7 mm → 0.016 mm, 5.83° → 0.020° in 15.2 s. Needs ~200 iters (rotation-translation coupling extends convergence vs 3-DOF). Backward-compatible: INIT_ROT_DEG="0,0,0" + identity phantom_quat → 3-DOF equivalent. |
+| 2026-05-26 | Bug: Slang rotation backward produces NaN                 | ❌ euler_eff.requires_grad=True (new in 6-DOF) triggers NaN in Slang's d(loss)/d(euler_eff) code path. Manifests: loss freezes at ~1.42 (constant image = renderer got NaN input). Adam accumulates NaN in exp_avg/exp_avg_sq, corrupting all subsequent updates. Fixed: torch.isnan(p.grad).any() → p.grad.zero_() to skip update, not propagate NaN. |
+| 2026-05-26 | Bug: arcsin-based euler decomposition → infinite gradient  | ❌ matrix_to_euler_zxy using arcsin(R[2,1].clamp(-1,1)) has gradient → ∞ at ±90°. With near-zero rotation signals, Adam drifts into gimbal lock zone → NaN. Fixed: switched to atan2(R[2,1], sqrt(R[2,0]²+R[2,2]²+ε)) which is bounded at all angles. |
 
 ---
 
@@ -637,6 +663,40 @@ Commands (in order):
   resolves against the mounted /workspace/ct_loader.py. Without this, Python
   only finds ct_loader if cwd happens to be /workspace.
 
+### 6-DOF registration (Phase 5k)
+
+- Slang autodiff produces **NaN for the rotation backward path** in some
+  configurations. The gradient is fine for translation (3-DOF), but
+  `d(loss)/d(euler_eff)` can NaN when `euler_eff.requires_grad=True` (the new
+  6-DOF code path). Symptom: loss freezes at a constant value (~1.42) after
+  the first backward that returns NaN, because Adam accumulates NaN in
+  exp_avg and exp_avg_sq, permanently corrupting the rotation parameter.
+  Fix: `if torch.isnan(p.grad).any(): p.grad.zero_()` — zero out rather than propagate.
+- **matrix_to_euler_zxy must use atan2, NOT arcsin.** arcsin(R[2,1]) has an
+  unbounded gradient at ±90° (gimbal lock). With near-zero rotation signal
+  (symmetric phantom), Adam drifts into the gimbal-lock region and NaN follows.
+  Always use `atan2(R[2,1], sqrt(R[2,0]² + R[2,2]² + ε))` for rx.
+- **6-DOF needs ~200 iterations** on the real CT. The rotation-translation
+  coupling (t_eff = R_phantom.T @ t_world) means early updates to phantom_rot
+  temporarily move the effective translation in the wrong direction. The
+  optimizer oscillates until ~iter 100-120, then converges. With 100 iters the
+  result is ~0.5 mm / ~0.8° — usable but not optimal. With 200 iters:
+  0.016 mm / 0.020°. Default N_ITERS=100 is kept for backward compatibility;
+  set N_ITERS=200 when 6-DOF accuracy matters.
+- **Rotation sign flip applies to both parameters.** The Slang autodiff sign-
+  flip (return negated grad) applies to `phantom_rot` exactly as it does to
+  `translation`. After `.backward()`, negate BOTH params' grads before
+  `optimizer.step()`. Confirmed by the real-CT convergence test — if rotation
+  had the wrong sign, it would diverge rather than converge.
+- **Spherical/symmetric phantom cannot constrain rotation.** A sphere produces
+  identical DRRs for any rotation, so rotation gradient ≈ 0 and the rotation
+  parameter drifts. For the synthetic ellipsoid phantom, expect rotation error
+  to settle at ~2-4° with INIT_ROT_DEG="5,0,3" — this is physically correct
+  behavior, NOT a bug. Use INIT_ROT_DEG="0,0,0" on the synthetic phantom to
+  suppress this (rotation stays at 0, translation converges normally).
+- The sign-flip rule and NaN guard are applied uniformly to all optimizable
+  parameters in a single loop: `for p in [translation, phantom_rot]`.
+
 ### Medical scene (Phases 5h–5j)
 
 - scenes/medical_scene.usd is **Y-up, 1 unit = 1 cm** — different from
@@ -745,7 +805,13 @@ python3 ~/isaac_projects/bridge/plot_registration.py
 ~/isaac_projects/bridge/run_register_multiview.sh
 # Override which views: angles in degrees around Y (LAO/RAO axis)
 VIEWS_DEG_Y="0,45,90" ~/isaac_projects/bridge/run_register_multiview.sh
-# Plot multi-view results (host-side)
+# Phase 5k (6-DOF): add rotation recovery (needs N_ITERS=200 for real CT)
+INIT_ROT_DEG="5,0,3" N_ITERS=200 ~/isaac_projects/bridge/run_register_multiview.sh
+# 6-DOF on real CT with pose.json ground truth (confirmed: 0.016 mm, 0.020°):
+DICOM_PATH=~/medical_imaging/spine_mets_ct_seg/10250/04098/27242 \
+  USE_POSE_JSON=1 N_ITERS=200 \
+  ~/isaac_projects/bridge/run_register_multiview.sh
+# Plot multi-view results (host-side) — 4th panel shows rotation error:
 python3 ~/isaac_projects/bridge/plot_registration_multiview.py
 
 # Phase 5 deliverable: compute T_robot_to_anatomy from registration + pose.json
