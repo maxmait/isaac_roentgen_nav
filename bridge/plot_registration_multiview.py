@@ -47,6 +47,11 @@ def main() -> int:
     loss_per_view = np.array([e["loss_per_view"] for e in trace])  # (N_iters, N_views)
     err = np.array([e["err_mm"] for e in trace])
     err_norm = np.array([e["err_norm_mm"] for e in trace])
+    # Rotation error — present in 6-DOF traces, absent in older 3-DOF traces
+    has_rot = "rot_err_euler_deg" in trace[0]
+    if has_rot:
+        rot_err = np.array([e["rot_err_euler_deg"] for e in trace])
+        rot_geo = np.array([e["rot_err_geodesic_deg"] for e in trace])
 
     print("=" * 60)
     print(f"Multi-view registration summary  ({len(views)} views)")
@@ -66,6 +71,13 @@ def main() -> int:
     print(f"  Wall time:            {summary['wall_seconds']:.1f} s "
           f"({summary['wall_seconds']/summary['n_iters']*1000:.0f} ms/iter)")
 
+    if has_rot:
+        print(f"  Init rot  offset (deg): {summary.get('init_rot_deg', 'n/a')}")
+        print(f"  Final rot ||err|| (°):  "
+              f"{summary.get('final_rot_err_geodesic_deg', 'n/a'):.4f} (geodesic)")
+        print(f"  Per-axis rot err  (°):  "
+              f"{[round(v, 4) for v in summary.get('final_rot_err_euler_deg', [])]}")
+
     ig = summary.get("isaac_ground_truth")
     if ig is not None:
         print()
@@ -76,6 +88,8 @@ def main() -> int:
         print(f"  Per-axis world err (mm): "
               f"{[round(v, 4) for v in ig['world_err_mm']]}")
         print(f"  World ||err|| (mm):      {ig['world_err_norm_mm']:.4f}")
+        if "rot_err_geodesic_deg" in ig:
+            print(f"  Rotation ||err|| (°):    {ig['rot_err_geodesic_deg']:.4f}")
 
     try:
         import matplotlib
@@ -87,8 +101,10 @@ def main() -> int:
         return 0
 
     # --- Figure 1: convergence ---------------------------------------------
-    fig, axes = plt.subplots(1, 3, figsize=(16, 4.5))
-    ax_loss, ax_per_view, ax_err = axes
+    n_panels = 4 if has_rot else 3
+    fig, axes = plt.subplots(1, n_panels, figsize=(5.5 * n_panels, 4.5))
+    ax_loss, ax_per_view, ax_err = axes[:3]
+    ax_rot = axes[3] if has_rot else None
 
     ax_loss.semilogy(iters, loss_total, color="black", label="total")
     ax_loss.set_xlabel("iteration")
@@ -105,23 +121,37 @@ def main() -> int:
     ax_per_view.grid(True, which="both", alpha=0.3)
 
     for i, label in enumerate("xyz"):
-        ax_err.plot(iters, err[:, i], label=f"err_{label}")
-    ax_err.plot(iters, err_norm, "k--", lw=1.2, label="||err||")
+        ax_err.plot(iters, err[:, i], label=f"t_err_{label}")
+    ax_err.plot(iters, err_norm, "k--", lw=1.2, label="||t_err||")
     ax_err.axhline(0, color="gray", lw=0.5)
     ax_err.set_xlabel("iteration")
     ax_err.set_ylabel("translation error (mm)")
-    ax_err.set_title("Per-axis error vs ground truth")
+    ax_err.set_title("Translation error vs GT")
     ax_err.legend(loc="best", fontsize=9)
     ax_err.grid(True, alpha=0.3)
 
+    if ax_rot is not None:
+        for i, label in enumerate("xyz"):
+            ax_rot.plot(iters, rot_err[:, i], label=f"r_err_{label}")
+        ax_rot.plot(iters, rot_geo, "k--", lw=1.2, label="geodesic")
+        ax_rot.axhline(0, color="gray", lw=0.5)
+        ax_rot.set_xlabel("iteration")
+        ax_rot.set_ylabel("rotation error (°)")
+        ax_rot.set_title("Rotation error vs GT")
+        ax_rot.legend(loc="best", fontsize=9)
+        ax_rot.grid(True, alpha=0.3)
+
     suptitle = (
         f"Multi-view registration  |  views: {[v['name'] for v in views]}  |  "
-        f"init offset = {summary['init_offset_mm']} mm  |  "
-        f"final ||err|| = {summary['final_err_norm_mm']:.3f} mm"
+        f"init t-offset = {summary['init_offset_mm']} mm  |  "
+        f"final ||t_err|| = {summary['final_err_norm_mm']:.3f} mm"
     )
+    if has_rot:
+        suptitle += (f"  |  final ||r_err|| = "
+                     f"{summary.get('final_rot_err_geodesic_deg', 0):.3f}°")
     if ig is not None:
         suptitle += f"  |  world err = {ig['world_err_norm_mm']:.3f} mm"
-    fig.suptitle(suptitle, fontsize=11)
+    fig.suptitle(suptitle, fontsize=10)
     fig.tight_layout()
     fig.savefig(CONVERGENCE_PNG, dpi=120, bbox_inches="tight")
     print(f"\nSaved {CONVERGENCE_PNG}")

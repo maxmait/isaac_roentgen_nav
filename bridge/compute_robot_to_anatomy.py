@@ -16,9 +16,9 @@ and recovered forms:
     T_A^C  anatomy in C-arm frame  (= what the registration directly recovers,
                                      just expressed in the C-arm frame)
 
-Translation-only error analysis. Phantom rotation is assumed identity (not yet
-recovered by registration); when 6-DOF registration lands, plug the recovered
-phantom orientation into `phantom_W_rec` below.
+6-DOF: both phantom translation AND rotation are recovered from the trace.
+If the trace predates the 6-DOF upgrade (no phantom_quat_recovered_wxyz key),
+falls back to identity rotation.
 
 Outputs:
     ~/isaac_projects/output/robot_to_anatomy.json
@@ -395,9 +395,11 @@ def main() -> int:
     phantom_W_gt = Pose.from_pos_quat_wxyz(
         pose["phantom_pos"], pose["phantom_quat"]
     )
-    # Phantom rotation not yet recovered → assume identity.
+    # Use recovered phantom rotation from 6-DOF registration if available.
+    # Falls back to identity for traces produced before the 6-DOF upgrade.
+    phantom_quat_rec = ig.get("phantom_quat_recovered_wxyz", [1.0, 0.0, 0.0, 0.0])
     phantom_W_rec = Pose.from_pos_quat_wxyz(
-        ig["phantom_pos_recovered_world_m"], [1.0, 0.0, 0.0, 0.0]
+        ig["phantom_pos_recovered_world_m"], phantom_quat_rec
     )
 
     # The three transforms, in both forms where applicable
@@ -416,12 +418,22 @@ def main() -> int:
     err_T_A_in_C_mm = err_T_A_in_C_m * 1000.0
     err_T_A_in_C_norm_mm = float(np.linalg.norm(err_T_A_in_C_mm))
 
-    # Sanity check: T_R^A error norm should match the registration's world err
-    assert abs(err_T_R_in_A_norm_mm - registration_err_norm_mm) < 1e-6, (
-        f"T_R^A error norm ({err_T_R_in_A_norm_mm:.6f} mm) does not match "
-        f"registration world_err_norm_mm ({registration_err_norm_mm:.6f} mm) — "
-        "math inconsistency."
-    )
+    # Rotation error between GT and recovered phantom orientation
+    R_rel = phantom_W_rec.R.T @ phantom_W_gt.R
+    cos_a = np.clip((np.trace(R_rel) - 1.0) / 2.0, -1.0, 1.0)
+    rot_err_deg = float(np.degrees(np.arccos(cos_a)))
+    rot_err_from_trace_deg = ig.get("rot_err_geodesic_deg", 0.0)
+
+    # Sanity check: T_R^A translational error should match the registration's
+    # world translation error when phantom rotation is recovered accurately.
+    # With imperfect rotation recovery, a small discrepancy is expected.
+    if abs(err_T_R_in_A_norm_mm - registration_err_norm_mm) > 0.1:
+        print(
+            f"WARNING: T_R^A translation error ({err_T_R_in_A_norm_mm:.4f} mm) "
+            f"differs from registration world_err_norm_mm "
+            f"({registration_err_norm_mm:.4f} mm) by more than 0.1 mm — "
+            "this may indicate residual rotation error coupling into translation."
+        )
 
     # Clinical interpretation
     clin = clinical_summary(T_R_in_A_rec.t)
@@ -452,6 +464,8 @@ def main() -> int:
     print(f"    Recovered:        {_fmt(T_A_in_C_rec.t * 1000.0)}")
     print(f"     Error per-axis:  {_fmt(err_T_A_in_C_mm)}")
     print(f"          Error norm: {err_T_A_in_C_norm_mm:.4f} mm")
+    print()
+    print(f"  Phantom rotation error (geodesic): {rot_err_deg:.4f} °")
     print()
     print(f"  T_robot_in_carm.t    (mm):  {_fmt(T_R_in_C.t * 1000.0)}")
     print(f"    (No GT/recovered split — C-arm pose is known regardless.)")
@@ -498,6 +512,8 @@ def main() -> int:
             "T_anatomy_in_carm_t_err_norm_mm": err_T_A_in_C_norm_mm,
             "T_robot_in_carm_t_err_mm": [0.0, 0.0, 0.0],
             "T_robot_in_carm_t_err_norm_mm": 0.0,
+            "phantom_rot_err_geodesic_deg": rot_err_deg,
+            "phantom_rot_err_from_trace_deg": rot_err_from_trace_deg,
         },
         "clinical": clin,
         "sources": {
@@ -507,8 +523,9 @@ def main() -> int:
             ),
             "registration_mode": mode,
         },
-        "assumptions": [
-            "Phantom rotation assumed identity — not yet recovered by registration."
+        "assumptions": [] if rot_err_deg < 0.1 else [
+            f"Phantom rotation residual error {rot_err_deg:.3f}° — "
+            "6-DOF registration recovered rotation with this geodesic error."
         ],
     }
     with open(RESULT_JSON, "w") as f:
