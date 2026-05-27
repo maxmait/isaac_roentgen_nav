@@ -277,9 +277,10 @@ needing a separate GUI session.
 - [x] Verified projection: shifting ee_pos by +30 mm in world Y moved the tool
       centroid by exactly +121 px in detector Y (predicted 120 px = 30 × 2 / 0.5).
       Confirms world→volume→detector geometry end-to-end.
-- [ ] Replace analytic ellipsoid + sphere abstraction with marching-cubes
-      meshes (real CT phantom, real Franka hand geometry) once we have the
-      source data.
+- [x] Replace analytic ellipsoid + sphere abstraction with marching-cubes
+      meshes (real CT phantom geometry done in Phase 5e; robot tool geometry
+      in the DRR μ-volume is still a sphere blob, tracked as Simulation
+      Simplification #1 under Phase 5).
 
 ### Phase 5: Registration Pipeline 🚧 IN PROGRESS
 - [x] Translation-only phantom-pose registration via fluorosim Slang autodiff
@@ -428,10 +429,12 @@ needing a separate GUI session.
       renders its target DRR *without* the EE blob (see "Simulation
       simplifications" in Known Issues).  Adding the tool requires either
       a tool-masking loss or robust matching; deferred.
-- [ ] Blind optimiser init — currently the optimiser starts at
-      `gt_translation_mm + INIT_OFFSET_MM` (simulating a planning prior
-      with ~20 mm noise).  A stricter "init from carm_pos only" would be
-      truly independent of GT; deferred.
+- [x] Blind optimiser init — `INIT_OFFSET_MM` is now an absolute starting
+      translation from the C-arm isocenter, not an offset from GT.
+      GT is read from pose.json for *evaluation only*, never for init.
+      When GT=0 (default test case) behaviour is identical to before.
+      init_err_norm_mm in the trace now reports the true initial error
+      ||init_trans − gt_translation_mm|| rather than ||INIT_OFFSET_MM||.
 
 ### Phase 6: Neural Network Acceleration 🔲 (optional/future)
 - [ ] Generate training dataset: random poses → DRR pairs
@@ -509,6 +512,11 @@ needing a separate GUI session.
 | 2026-05-26 | Phase 5k: 6-DOF registration (translation + rotation)    | ✅ register_phantom_multiview.py and register_phantom.py extended with shared phantom_rot (ZXY Euler, rad) optimized jointly with translation. Helpers: euler_zxy_to_matrix (differentiable) + matrix_to_euler_zxy (atan2-based, stable at gimbal lock). Sign-flip applies to both params. NaN guard on rotation backward (Slang NaN propagation bug). On real spine CT at N_ITERS=200: 19.7 mm → 0.016 mm, 5.83° → 0.020° in 15.2 s. Needs ~200 iters (rotation-translation coupling extends convergence vs 3-DOF). Backward-compatible: INIT_ROT_DEG="0,0,0" + identity phantom_quat → 3-DOF equivalent. |
 | 2026-05-26 | Bug: Slang rotation backward produces NaN                 | ❌ euler_eff.requires_grad=True (new in 6-DOF) triggers NaN in Slang's d(loss)/d(euler_eff) code path. Manifests: loss freezes at ~1.42 (constant image = renderer got NaN input). Adam accumulates NaN in exp_avg/exp_avg_sq, corrupting all subsequent updates. Fixed: torch.isnan(p.grad).any() → p.grad.zero_() to skip update, not propagate NaN. |
 | 2026-05-26 | Bug: arcsin-based euler decomposition → infinite gradient  | ❌ matrix_to_euler_zxy using arcsin(R[2,1].clamp(-1,1)) has gradient → ∞ at ±90°. With near-zero rotation signals, Adam drifts into gimbal lock zone → NaN. Fixed: switched to atan2(R[2,1], sqrt(R[2,0]²+R[2,2]²+ε)) which is bounded at all angles. |
+| 2026-05-27 | Blind optimiser init — remove GT from registration start | ✅ register_phantom*.py: init_trans = INIT_OFFSET_MM (absolute, from C-arm isocenter), no longer gt_translation_mm + INIT_OFFSET_MM. GT used for scoring only. init_err_norm_mm now reports true ‖init_trans − gt‖. Backward-compatible when GT=0 (identical). |
+| 2026-05-27 | Live test: 3cm C-arm Z-shift in GUI → blind 6-DOF on real CT | ✅ End-to-end on live Isaac Sim medical_scene. C-arm moved +30mm Z in GUI, captured via add_carm_shot.py → pose.json gt_translation_mm=(0,0,30). Blind init reported true 28.443mm error (would've been 19.7 under old GT-leak). Validated the blind-init fix on real scene data. |
+| 2026-05-27 | Finding: 2-view 6-DOF has limited blind capture range    | ⚠️ With the honest 28mm blind start, 2 orthogonal views (0°,90°) settled in a tx↔ry coupling local min (~2.06mm / 6.15°) — the +30mm Z was recovered (tz err 0.09mm) but tx drifted +2mm and ry −6° together (in-plane translation↔rotation ambiguity). Independent of INIT_ROT_DEG (drifts to same min from rot=0). GT-leak init had masked this. Fix: add an oblique 3rd view. |
+| 2026-05-27 | Fix: 3rd oblique view (0°,45°,90°) breaks tx↔ry coupling | ✅ Same blind 28mm start → 0.003mm / 0.000° (better than the GT-leak 2-view 0.016mm). Default VIEWS_DEG_Y changed (0,90)→(0,45,90) in register_phantom_multiview.py. ≥3 views (one oblique) now the recommended robust 6-DOF workflow. |
+| 2026-05-27 | Env: nvidia-container-toolkit lost on driver downgrade    | ⚠️ Driver 590→550 (to dodge 595 breaking Isaac Sim) uninstalled nvidia-container-toolkit; docker --gpus failed. Reinstalled toolkit + nvidia-ctk runtime configure. Then driver 550 (CUDA 12.4) < container cuda>=12.6 → REQUIRE check + consumer-GPU forward-compat error 804. Resolved by installing a driver ≥560 (CUDA≥12.6); container then runs unmodified. |
 
 ---
 
@@ -696,6 +704,29 @@ Commands (in order):
   suppress this (rotation stays at 0, translation converges normally).
 - The sign-flip rule and NaN guard are applied uniformly to all optimizable
   parameters in a single loop: `for p in [translation, phantom_rot]`.
+- **Use ≥3 views (one oblique) for robust blind 6-DOF.** Two orthogonal views
+  (0°, 90°) leave the in-plane translation↔rotation ambiguity (tx↔ry) unbroken.
+  From a truly blind start (~28mm, e.g. INIT_OFFSET_MM with a real off-isocenter
+  GT) the optimizer can settle in a ~2mm / 6° local minimum: it recovers the
+  depth offset but trades a few-mm in-plane translation against a few-degree
+  rotation. Adding an oblique view (0°, 45°, 90°) disambiguates it →
+  0.003mm / 0.000°. This local min was hidden while the optimiser init leaked
+  GT (it always started close, in a benign direction); the blind-init change
+  (2026-05-27) exposed it. Default VIEWS_DEG_Y is now (0,45,90). The 2-view
+  case still works when the start is close to GT (small INIT_OFFSET_MM).
+  How each view-source path picks up the 3rd view:
+    • Synthetic-angle path (USE_CARM_ROTATION unset): uses VIEWS_DEG_Y default
+      (0,45,90) — third view automatic.
+    • Captured-shots path (USE_CARM_ROTATION=1, view_angles_deg list in
+      pose.json): uses EXACTLY the shots you captured — capture a 45° shot via
+      rotate_carm.py + add_carm_shot.py to get the oblique view (it is NOT
+      injected for you, by design — captured shots are an explicit choice).
+    • Single-shot fallback (USE_CARM_ROTATION=1, only carm_rotation_y_deg):
+      synthesizes (base, base+45, base+90) — third view automatic.
+- **Blind init**: INIT_OFFSET_MM is the absolute starting translation (offset
+  from the C-arm isocenter), NOT an offset from GT. GT (from pose.json) is read
+  for scoring only. init_err_norm_mm in the trace = ‖init_trans − gt‖, the true
+  initial error. When GT=0 this equals ‖INIT_OFFSET_MM‖ (old behaviour).
 
 ### Medical scene (Phases 5h–5j)
 
@@ -744,22 +775,17 @@ unchecked items:
    loss, or accept that the tool is "known geometry" the registration
    subtracts before matching.
 
-2. **Optimizer init uses GT + INIT_OFFSET_MM**.  In
-   register_phantom_multiview.py:
-       init_trans = gt_translation_mm + INIT_OFFSET_MM
-   The 20 mm offset simulates pre-op planning error, but the chain reads
-   the ground truth to construct the starting pose.  Once the optimiser
-   is running it only sees the target image — but the *capture range*
-   (how far off you can start and still converge) is hidden behind this
-   prior.  A stricter "blind init from carm_pos" (treating the phantom
-   as roughly at the C-arm isocenter — the standard clinical assumption)
-   would be independent of GT but might fail to converge if the actual
-   phantom is too far from isocenter.  Worth doing as a separate
-   characterisation experiment.
+2. **Optimizer init** — ✅ **Fixed (no longer a simplification).**
+   `INIT_OFFSET_MM` is now an absolute offset from the C-arm isocenter
+   (the clinical "anatomy is approximately where I parked the C-arm"
+   assumption). GT is not used for initialisation. Verified: with GT=0
+   (default test case) results are identical to before; with GT≠0 the
+   optimizer starts ||GT|| + ~20 mm from the answer and still converges.
 
-In both cases the registration ALGORITHM is identical to what would be
-used clinically.  The simplifications affect *how realistic the input
-is*, not *whether the math works*.
+Only the first simplification (tool not in registration target) remains
+open. The registration ALGORITHM is identical to what would be used
+clinically; that simplification affects *input realism*, not *whether
+the math works*.
 
 ---
 
@@ -801,13 +827,17 @@ INIT_OFFSET_MM="30,0,0" LR_MM=2.0 N_ITERS=200 ~/isaac_projects/bridge/run_regist
 # Plot the registration convergence + image comparison (host-side)
 python3 ~/isaac_projects/bridge/plot_registration.py
 
-# Phase 5 (multi-view): clinical sequential AP + lateral C-arm shots
+# Phase 5 (multi-view): clinical sequential C-arm shots (default views 0,45,90)
 ~/isaac_projects/bridge/run_register_multiview.sh
 # Override which views: angles in degrees around Y (LAO/RAO axis)
-VIEWS_DEG_Y="0,45,90" ~/isaac_projects/bridge/run_register_multiview.sh
+# 2 views (0,90) is faster but only robust when the start is close to GT;
+# use 3 views (one oblique) for a blind start — see "Use ≥3 views" note above.
+VIEWS_DEG_Y="0,90" ~/isaac_projects/bridge/run_register_multiview.sh
 # Phase 5k (6-DOF): add rotation recovery (needs N_ITERS=200 for real CT)
 INIT_ROT_DEG="5,0,3" N_ITERS=200 ~/isaac_projects/bridge/run_register_multiview.sh
-# 6-DOF on real CT with pose.json ground truth (confirmed: 0.016 mm, 0.020°):
+# 6-DOF on real CT with pose.json ground truth.
+#   GT=0 (C-arm at isocenter), 3 views: 0.016 mm, 0.020°
+#   blind 28mm start (3cm off-isocenter C-arm), 3 views: 0.003 mm, 0.000°
 DICOM_PATH=~/medical_imaging/spine_mets_ct_seg/10250/04098/27242 \
   USE_POSE_JSON=1 N_ITERS=200 \
   ~/isaac_projects/bridge/run_register_multiview.sh
@@ -852,11 +882,16 @@ DICOM_PATH=~/medical_imaging/spine_mets_ct_seg/10250/04098/27242 \
 python3 ~/isaac_projects/scenes/isaacsim_client.py "CARM_ROTATION_DEG=45
 $(cat ~/isaac_projects/scenes/rotate_carm.py)"
 
-# Workflow A (command-line, recommended): two-shot capture
+# Workflow A (command-line, recommended): three-shot capture (0°, 45°, 90°).
+# The oblique 45° view breaks the tx<->ry coupling that stalls blind 6-DOF
+# with only two views (see "Use >=3 views" note above).
 python3 ~/isaac_projects/scenes/isaacsim_client.py "CARM_ROTATION_DEG=0
 $(cat ~/isaac_projects/scenes/rotate_carm.py)"
 python3 ~/isaac_projects/scenes/isaacsim_client.py "RESET_SHOTS=1
 $(cat ~/isaac_projects/scenes/add_carm_shot.py)"
+python3 ~/isaac_projects/scenes/isaacsim_client.py "CARM_ROTATION_DEG=45
+$(cat ~/isaac_projects/scenes/rotate_carm.py)"
+python3 ~/isaac_projects/scenes/isaacsim_client.py < ~/isaac_projects/scenes/add_carm_shot.py
 python3 ~/isaac_projects/scenes/isaacsim_client.py "CARM_ROTATION_DEG=90
 $(cat ~/isaac_projects/scenes/rotate_carm.py)"
 python3 ~/isaac_projects/scenes/isaacsim_client.py < ~/isaac_projects/scenes/add_carm_shot.py
