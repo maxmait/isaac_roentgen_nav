@@ -279,11 +279,12 @@ def main() -> int:
           f"std={target_np.std():.4f}")
 
     # --- Optimizer setup -----------------------------------------------------
+    # Blind init: start from C-arm isocenter + planning offset, no GT knowledge.
+    # INIT_OFFSET_MM is an absolute offset from the isocenter (not from GT).
+    # GT is used only for error reporting, never for initialisation.
     print("\n[3] Building differentiable renderer at perturbed pose...")
-    init_trans = (np.asarray(gt_translation_mm,    dtype=np.float32)
-                  + np.asarray(INIT_OFFSET_MM,    dtype=np.float32))
-    init_rot   = (np.asarray(gt_phantom_rot_euler, dtype=np.float32)
-                  + init_rot_rad)
+    init_trans = np.asarray(INIT_OFFSET_MM, dtype=np.float32)
+    init_rot   = init_rot_rad.copy()
 
     drr_module, _, translation, _ = create_slang_diffdrr_optimizer(
         mu_volume=mu,
@@ -305,14 +306,16 @@ def main() -> int:
     target = torch.from_numpy(target_np).to(translation.device)
     rot_gantry = R_gantry.to(translation.device)
 
+    init_trans_err = init_trans - np.asarray(gt_translation_mm, dtype=np.float32)
+    init_rot_err_deg = np.degrees(init_rot) - np.degrees(np.asarray(gt_phantom_rot_euler, dtype=np.float32))
     print(f"  Init translation (mm):  {init_trans.tolist()}")
     print(f"  GT   translation (mm):  {list(gt_translation_mm)}")
     print(f"  Init rot (deg):         "
           f"{[round(math.degrees(v), 3) for v in init_rot.tolist()]}")
     print(f"  GT   rot (deg):         "
           f"{[round(math.degrees(v), 3) for v in gt_phantom_rot_euler]}")
-    print(f"  Init trans ||err||:  {np.linalg.norm(INIT_OFFSET_MM):.3f} mm")
-    print(f"  Init rot   ||err||:  {np.linalg.norm(INIT_ROT_DEG):.3f} °")
+    print(f"  Init trans ||err||:  {np.linalg.norm(init_trans_err):.3f} mm")
+    print(f"  Init rot   ||err||:  {np.linalg.norm(init_rot_err_deg):.3f} °")
 
     with torch.no_grad():
         R_gt_np = euler_zxy_to_matrix(
@@ -408,8 +411,8 @@ def main() -> int:
         "final_err_norm_mm":       trace[-1]["err_norm_mm"],
         "final_rot_err_euler_deg": trace[-1]["rot_err_euler_deg"],
         "final_rot_err_geodesic_deg": trace[-1]["rot_err_geodesic_deg"],
-        "init_err_norm_mm":        float(np.linalg.norm(INIT_OFFSET_MM)),
-        "init_rot_err_norm_deg":   float(np.linalg.norm(INIT_ROT_DEG)),
+        "init_err_norm_mm":        float(np.linalg.norm(init_trans_err)),
+        "init_rot_err_norm_deg":   float(np.linalg.norm(init_rot_err_deg)),
         "n_iters":    N_ITERS,
         "lr_mm":      LR_MM,
         "lr_rot_rad": LR_ROT_RAD,
@@ -448,10 +451,10 @@ def main() -> int:
     print("\n" + "=" * 60)
     print("Summary")
     print("=" * 60)
-    print(f"  Init trans  ||err||:  {np.linalg.norm(INIT_OFFSET_MM):.3f} mm")
+    print(f"  Init trans  ||err||:  {np.linalg.norm(init_trans_err):.3f} mm")
     print(f"  Final trans ||err||:  {trace[-1]['err_norm_mm']:.4f} mm")
     print(f"  Final per-axis (mm):  {[round(v, 4) for v in trace[-1]['err_mm']]}")
-    print(f"  Init rot    ||err||:  {np.linalg.norm(INIT_ROT_DEG):.3f} °")
+    print(f"  Init rot    ||err||:  {np.linalg.norm(init_rot_err_deg):.3f} °")
     print(f"  Final rot   ||err||:  {trace[-1]['rot_err_geodesic_deg']:.4f} ° (geodesic)")
     print(f"  Loss: {trace[0]['loss']:.4e} -> {trace[-1]['loss']:.4e}")
     print(f"  Wall time: {elapsed:.1f} s ({elapsed / N_ITERS * 1000:.0f} ms/iter)")

@@ -92,7 +92,11 @@ def _env_views_deg(default: tuple[float, ...]) -> tuple[float, ...]:
     return tuple(float(v) for v in raw.split(","))
 
 
-VIEWS_DEG_Y: tuple[float, ...] = _env_views_deg((0.0, 90.0))
+# Default to 3 views (one oblique).  Two orthogonal views (0,90) leave the
+# in-plane translation↔rotation (tx↔ry) ambiguity unbroken in 6-DOF, so a
+# truly blind start can settle in a ~2mm/6° local minimum.  The oblique 45°
+# view disambiguates it — verified: blind 28mm start → 0.003mm/0.000°.
+VIEWS_DEG_Y: tuple[float, ...] = _env_views_deg((0.0, 45.0, 90.0))
 USE_CARM_ROTATION = bool(int(os.environ.get("USE_CARM_ROTATION", "0")))
 
 INIT_OFFSET_MM  = _envv("INIT_OFFSET_MM",  (15.0, -10.0, 8.0))
@@ -287,8 +291,12 @@ def main() -> int:
             print(f"USE_CARM_ROTATION=1: view_angles_deg from pose.json = "
                   f"{[f'{a:+.1f}' for a in view_angles]}°")
         elif "carm_rotation_y_deg" in _pose:
+            # Only one shot captured — synthesize an orthogonal pair plus an
+            # oblique view (base, +45, +90).  The oblique view breaks the
+            # in-plane tx<->ry coupling that stalls 2-view blind 6-DOF; see the
+            # "Use >=3 views" note in CLAUDE.md.
             base = float(_pose["carm_rotation_y_deg"])
-            view_angles = (base, base + 90.0)
+            view_angles = (base, base + 45.0, base + 90.0)
             print(f"USE_CARM_ROTATION=1: single-shot AP={base:+.1f}° "
                   f"-> views (ry) = {view_angles}")
 
@@ -347,11 +355,12 @@ def main() -> int:
               f"range=[{img.min():.4f}, {img.max():.4f}]  std={img.std():.4f}")
 
     # --- Optimizer setup -----------------------------------------------------
+    # Blind init: start from C-arm isocenter + planning offset, no GT knowledge.
+    # INIT_OFFSET_MM is an absolute offset from the isocenter (not from GT).
+    # GT is used only for error reporting, never for initialisation.
     print("\n[3] Initializing the registration at a perturbed pose...")
-    init_trans = (np.asarray(gt_translation_mm,    dtype=np.float32)
-                  + np.asarray(INIT_OFFSET_MM,    dtype=np.float32))
-    init_rot   = (np.asarray(gt_phantom_rot_euler, dtype=np.float32)
-                  + init_rot_rad)
+    init_trans = np.asarray(INIT_OFFSET_MM, dtype=np.float32)
+    init_rot   = init_rot_rad.copy()
 
     drr_module, _, translation, _ = create_slang_diffdrr_optimizer(
         mu_volume=mu,
@@ -378,14 +387,16 @@ def main() -> int:
     ]
     targets = [torch.from_numpy(t).to(translation.device) for t in targets_np]
 
+    init_trans_err = init_trans - np.asarray(gt_translation_mm, dtype=np.float32)
+    init_rot_err_deg = np.degrees(init_rot) - np.degrees(np.asarray(gt_phantom_rot_euler, dtype=np.float32))
     print(f"  Init translation (mm):  {init_trans.tolist()}")
     print(f"  GT   translation (mm):  {list(gt_translation_mm)}")
     print(f"  Init rot (deg):         "
           f"{[round(math.degrees(v), 3) for v in init_rot.tolist()]}")
     print(f"  GT   rot (deg):         "
           f"{[round(math.degrees(v), 3) for v in gt_phantom_rot_euler]}")
-    print(f"  Init translation ||err||: {np.linalg.norm(INIT_OFFSET_MM):.3f} mm")
-    print(f"  Init rotation    ||err||: {np.linalg.norm(INIT_ROT_DEG):.3f} °")
+    print(f"  Init translation ||err||: {np.linalg.norm(init_trans_err):.3f} mm")
+    print(f"  Init rotation    ||err||: {np.linalg.norm(init_rot_err_deg):.3f} °")
 
     # Build GT rotation matrix once for error reporting
     gt_rot_np = np.asarray(gt_phantom_rot_euler, dtype=np.float64)
@@ -506,8 +517,8 @@ def main() -> int:
         "final_err_norm_mm":     trace[-1]["err_norm_mm"],
         "final_rot_err_euler_deg": trace[-1]["rot_err_euler_deg"],
         "final_rot_err_geodesic_deg": trace[-1]["rot_err_geodesic_deg"],
-        "init_err_norm_mm":      float(np.linalg.norm(INIT_OFFSET_MM)),
-        "init_rot_err_norm_deg": float(np.linalg.norm(INIT_ROT_DEG)),
+        "init_err_norm_mm":      float(np.linalg.norm(init_trans_err)),
+        "init_rot_err_norm_deg": float(np.linalg.norm(init_rot_err_deg)),
         "n_iters":   N_ITERS,
         "lr_mm":     LR_MM,
         "lr_rot_rad": LR_ROT_RAD,
@@ -550,11 +561,11 @@ def main() -> int:
     print("\n" + "=" * 60)
     print(f"Summary  ({len(views)} views: {[v['name'] for v in views]})")
     print("=" * 60)
-    print(f"  Init translation  ||err||:  {np.linalg.norm(INIT_OFFSET_MM):.3f} mm")
+    print(f"  Init translation  ||err||:  {np.linalg.norm(init_trans_err):.3f} mm")
     print(f"  Final translation ||err||:  {trace[-1]['err_norm_mm']:.4f} mm")
     print(f"  Final per-axis trans err:   "
           f"{[round(v, 4) for v in trace[-1]['err_mm']]} mm")
-    print(f"  Init  rotation    ||err||:  {np.linalg.norm(INIT_ROT_DEG):.3f} °")
+    print(f"  Init  rotation    ||err||:  {np.linalg.norm(init_rot_err_deg):.3f} °")
     print(f"  Final rotation    ||err||:  "
           f"{trace[-1]['rot_err_geodesic_deg']:.4f} ° (geodesic)")
     print(f"  Final per-axis rot err:     "

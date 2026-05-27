@@ -4,7 +4,9 @@
 # Output: ~/isaac_projects/output/registration_multiview/
 #
 # Environment variables (all optional):
-#   VIEWS_DEG_Y     comma-separated LAO/RAO angles in degrees (default "0,90")
+#   VIEWS_DEG_Y     comma-separated LAO/RAO angles in degrees (default "0,45,90")
+#                   3 views (one oblique) needed for robust blind 6-DOF — two
+#                   orthogonal views leave the tx<->ry ambiguity unbroken.
 #   INIT_OFFSET_MM  perturbation in fluorosim translation space (default "15,-10,8")
 #   INIT_ROT_DEG    perturbation in phantom rotation (ZXY Euler, default "5,0,3")
 #   LR_MM           Adam learning rate for translation          (default 1.0)
