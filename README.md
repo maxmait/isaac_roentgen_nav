@@ -178,13 +178,21 @@ cd ~/isaac_projects
 # Open scenes/medical_scene.usd in the Isaac Sim GUI first.
 # Pose the STAR robot's needle near the spine using the GUI manipulators.
 
-# Rotate C-arm to view 1 (e.g. AP) and record the shot
+# Capture three shots (0°, 45°, 90°). The oblique 45° view breaks the
+# in-plane tx<->ry coupling that stalls blind 6-DOF with only two views.
+
+# View 1 — AP (0°); RESET_SHOTS clears any prior shot list
 python3 scenes/isaacsim_client.py "CARM_ROTATION_DEG=0
 $(cat scenes/rotate_carm.py)"
 python3 scenes/isaacsim_client.py "RESET_SHOTS=1
 $(cat scenes/add_carm_shot.py)"
 
-# Rotate to view 2 (e.g. lateral) and record
+# View 2 — oblique (45°)
+python3 scenes/isaacsim_client.py "CARM_ROTATION_DEG=45
+$(cat scenes/rotate_carm.py)"
+python3 scenes/isaacsim_client.py < scenes/add_carm_shot.py
+
+# View 3 — lateral (90°)
 python3 scenes/isaacsim_client.py "CARM_ROTATION_DEG=90
 $(cat scenes/rotate_carm.py)"
 python3 scenes/isaacsim_client.py < scenes/add_carm_shot.py
@@ -294,6 +302,33 @@ rotation and translation untangle, then converges sharply.*
 0.015 (AP) and 0.010 (lateral) is near the noise floor of the differentiable
 renderer.*
 
+### Blind initialization and the need for a third view
+
+The optimizer is initialized **without any knowledge of the ground-truth
+anatomy pose** — it starts from the C-arm isocenter plus a fixed planning
+offset (`INIT_OFFSET_MM`), exactly as a real procedure would (the C-arm is
+parked roughly over the patient; the true anatomy pose is the unknown being
+solved for). Ground truth is used only to *score* the result.
+
+Validated end-to-end on a live Isaac Sim scene: the C-arm was physically moved
+**+30 mm** off the spine in the GUI, captured to `pose.json`, and registered on
+the real spine CT from a genuinely blind 28 mm start.
+
+This honest setup surfaced a real property of two-view 6-DOF registration:
+
+| Views | Trans ‖err‖ | Rot ‖err‖ | Outcome |
+|---|---|---|---|
+| AP + lateral (0°, 90°) | 2.06 mm | 6.15° | **stuck** — in-plane tx↔ry coupling local minimum |
+| AP + **oblique** + lateral (0°, 45°, 90°) | **0.003 mm** | **0.000°** | clean convergence |
+
+Two orthogonal views leave an ambiguity between in-plane translation and
+rotation (a few-mm shift looks almost identical to a few-degree rotation in
+both projections); the depth offset is recovered but `tx`/`ry` drift together.
+A single oblique view breaks it. **Three views (one oblique) is therefore the
+default and recommended workflow for robust blind 6-DOF registration** —
+`VIEWS_DEG_Y` defaults to `0,45,90`. (The two-view case is still fine when the
+starting pose is already close to the answer.)
+
 ### T_robot_in_anatomy — end-to-end on a real Isaac Sim scene
 
 ```
@@ -308,8 +343,8 @@ Clinical: Tool tip is INSIDE the bone core (normalized distance 0.77).
 
 ### Simulation simplifications (honest about what's not real)
 
-Two known places where the simulation is more permissive than a clinical
-setting. They do not change the registration algorithm — only the input
+One remaining place where the simulation is more permissive than a clinical
+setting. It does not change the registration algorithm — only the input
 realism:
 
 1. **The registration's target DRR does not include the robot tool.**
@@ -321,13 +356,11 @@ realism:
    the MSE loss. Real-world fluoroscopy registration handles this with
    masking or a robust loss.
 
-2. **The optimiser is initialised at `gt_translation_mm + 20 mm`.**
-   The 20 mm offset simulates pre-op planning error, but the chain reads
-   the ground truth to construct the starting pose. Once the optimiser is
-   running it only sees the target image — but the *capture range* (how
-   far off it can start and still converge) is hidden behind this prior.
-   A stricter "blind init from C-arm isocenter only" is independent of
-   GT and a worthwhile follow-up experiment.
+*Previously a second simplification — the optimizer being initialized at
+`gt_translation_mm + offset` — was removed: initialization is now blind (from
+the C-arm isocenter only, independent of ground truth). See
+[Blind initialization](#blind-initialization-and-the-need-for-a-third-view)
+above.*
 
 ---
 
@@ -407,12 +440,17 @@ isaac_roentgen_nav/
   (3 DOF) and orientation (3 DOF). On real spine CT: **0.016 mm / 0.020°** in
   200 iters (15.2 s). Backward-compatible: set `INIT_ROT_DEG="0,0,0"` to
   revert to 3-DOF translation-only mode
+- **Blind initialization** — the optimizer no longer uses ground truth to
+  construct its starting pose; it inits from the C-arm isocenter + planning
+  offset only. Validated on a live scene with a +30 mm off-isocenter C-arm.
+  Exposed (and fixed, via a third oblique view) the two-view tx↔ry coupling:
+  3 views → **0.003 mm / 0.000°** from a 28 mm blind start
 
 **Next:**
 
-- **Tool in registration target image + blind init** — see "Simulation
-  simplifications" above. Two independent improvements to make the
-  fluoroscopy simulation match a clinical setting more strictly.
+- **Tool in registration target image** — see "Simulation simplifications"
+  above. Paint the EE blob into the target DRR and add a tool mask / robust
+  loss so the registration matches a clinical setting more strictly.
 - **Trajectory planning** — consume T_R^A to drive the robot toward a
   surgical target while keeping the tool tip inside a safety region
 
