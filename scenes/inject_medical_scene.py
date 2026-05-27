@@ -11,7 +11,7 @@ from pathlib import Path
 
 import numpy as np
 import omni.usd
-from pxr import Gf, Sdf, UsdGeom, Vt
+from pxr import Gf, Sdf, UsdGeom, UsdPhysics, Vt
 
 PROJ = Path("/home/max/isaac_projects")
 sys.path.insert(0, str(PROJ / "scenes"))
@@ -69,14 +69,27 @@ base.CreateDisplayColorAttr(Vt.Vec3fArray([Gf.Vec3f(0.2, 0.2, 0.2)]))
 def _set_or_add_op(xformable, op_name, value):
     for op in xformable.GetOrderedXformOps():
         if op.GetOpName() == op_name:
-            op.Set(value)
+            if op_name == "xformOp:orient":
+                # Coerce to the precision already on disk to avoid type mismatch.
+                r, im = value.GetReal(), value.GetImaginary()
+                prec = op.GetPrecision()
+                coerced = (Gf.Quatd(r, Gf.Vec3d(*im))
+                           if prec == UsdGeom.XformOp.PrecisionDouble
+                           else Gf.Quatf(r, Gf.Vec3f(*im)))
+                op.Set(coerced)
+            else:
+                op.Set(value)
             return
     if op_name == "xformOp:translate":
         xformable.AddTranslateOp().Set(value)
     elif op_name == "xformOp:scale":
         xformable.AddScaleOp().Set(value)
     elif op_name == "xformOp:orient":
-        xformable.AddOrientOp().Set(value)
+        # New op — always use float; most Isaac Sim assets use float quats.
+        r, im = value.GetReal(), value.GetImaginary()
+        xformable.AddOrientOp(UsdGeom.XformOp.PrecisionFloat).Set(
+            Gf.Quatf(r, Gf.Vec3f(*im))
+        )
 
 
 def set_xform(prim, translate=None, rotate=None, scale=None, orient=None):
@@ -97,14 +110,10 @@ def set_xform(prim, translate=None, rotate=None, scale=None, orient=None):
 
 base_xf = UsdGeom.Xformable(base)
 
-# Base size in meters (converted to stage units via scale_factor)
-base_size_m = (0.6, 0.6, 0.35)
-base_scale = tuple(s * scale_factor for s in base_size_m)
-base_pos = [center[0], center[1], center[2]]
-base_pos[axis_a] = max_pt[axis_a] + 0.4 * scale_factor
-base_pos[axis_b] = center_b
-base_pos[axis_index] = min_pt[axis_index] + 0.5 * base_scale[axis_index]
-set_xform(base, translate=base_pos, scale=base_scale)
+# Hardcoded corrected position/scale (stage units = cm, Y-up).
+BASE_TRANSLATE = (80.23421590587323, 31.597864985466003, -17.75986671447754)
+BASE_SCALE     = (60.0, 60.0, 35.0)
+set_xform(base, translate=BASE_TRANSLATE, scale=BASE_SCALE)
 
 # --- Add robot reference ---
 if stage.GetPrimAtPath(ROBOT_ROOT):
@@ -116,25 +125,51 @@ robot_prim.GetReferences().AddReference(robot_usd)
 
 robot_xf = UsdGeom.Xformable(robot_prim)
 
-# Place robot on top of the base block
-robot_pos = [base_pos[0], base_pos[1], base_pos[2]]
-robot_pos[axis_index] = base_pos[axis_index] + 0.5 * base_scale[axis_index]
-
-# Face the robot toward the table center in the horizontal plane.
-dir_a = center_a - base_pos[axis_a]
-dir_b = center_b - base_pos[axis_b]
-heading_deg = np.degrees(np.arctan2(dir_b, dir_a))
-axis_vec = [0.0, 0.0, 0.0]
-axis_vec[axis_index] = 1.0
-rot_quat = Gf.Rotation(Gf.Vec3d(*axis_vec), heading_deg).GetQuat()
+# Hardcoded corrected pose (stage units = cm, Y-up).
+# Orientation: 180° rotation around (0, 0.6983, 0.7158) so the arm faces the table.
+ROBOT_TRANSLATE = (78.07537992456594, 61.59786605834972, -17.75986671447753)
+ROBOT_ORIENT    = Gf.Quatf(0, Gf.Vec3f(0, 0.69827778804614, 0.7158268860006517))
 set_xform(
     robot_prim,
-    translate=robot_pos,
-    orient=rot_quat,
+    translate=ROBOT_TRANSLATE,
+    orient=ROBOT_ORIENT,
     scale=(scale_factor, scale_factor, scale_factor),
 )
 
-print(f"Robot: {ROBOT_KIND} at {robot_pos}, scale={scale_factor}")
+print(f"Robot: {ROBOT_KIND} at {ROBOT_TRANSLATE}, scale={scale_factor}")
+
+# --- Author joint drives + target positions (degrees) ---
+# RemovePrim wipes any drives that were previously authored in this layer, so
+# we must re-apply DriveAPI and set stiffness/damping every injection.
+JOINT_TARGETS = {
+    "star_joint_1":    -6.5,
+    "star_joint_2":    55.5,
+    "star_joint_3":     5.0,
+    "star_joint_4":   -25.5,
+    "star_joint_5":     8.3,
+    "star_joint_6":    68.1,
+    "star_joint_7":     0.0,
+    "endo360_joint_1":  0.0,
+}
+_applied = set()
+for prim in stage.Traverse():
+    if not str(prim.GetPath()).startswith(ROBOT_ROOT + "/"):
+        continue
+    if prim.GetName() not in JOINT_TARGETS:
+        continue
+    deg = JOINT_TARGETS[prim.GetName()]
+    drive = UsdPhysics.DriveAPI.Apply(prim, "angular")
+    drive.CreateTypeAttr("force")
+    drive.CreateStiffnessAttr(1e9)
+    drive.CreateDampingAttr(1e7)
+    drive.CreateMaxForceAttr(1e20)
+    drive.CreateTargetPositionAttr(float(deg))
+    _applied.add(prim.GetName())
+    print(f"  drive {prim.GetPath()} → {deg}°")
+
+_missing = set(JOINT_TARGETS) - _applied
+if _missing:
+    print(f"  WARNING: joints not found after reference load: {_missing}")
 
 # --- Add CT mesh on the table ---
 if not CT_PHANTOM_MESH_OBJ.exists():
@@ -156,25 +191,30 @@ phantom.CreatePointsAttr(Vt.Vec3fArray(verts.tolist()))
 phantom.CreateFaceVertexIndicesAttr(Vt.IntArray(faces.flatten().tolist()))
 phantom.CreateFaceVertexCountsAttr(Vt.IntArray([3] * len(faces)))
 phantom.CreateSubdivisionSchemeAttr("none")
+phantom.CreateDoubleSidedAttr(True)
 phantom.CreateDisplayColorAttr(Vt.Vec3fArray([Gf.Vec3f(0.93, 0.90, 0.82)]))
 
-# Compute mesh local bounds to place it on the table top
-local_min = np.min(verts, axis=0)
-mesh_min_up = local_min[axis_index] * scale_factor
+# Extent must be set so the renderer/BBoxCache use the correct world bounds.
+local_min = verts.min(axis=0).tolist()
+local_max = verts.max(axis=0).tolist()
+phantom.CreateExtentAttr(
+    Vt.Vec3fArray([Gf.Vec3f(*local_min), Gf.Vec3f(*local_max)])
+)
 
-table_top = max_pt[axis_index]
-phantom_pos = [center[0], center[1], center[2]]
-phantom_pos[axis_b] = center_b
-phantom_pos[axis_index] = table_top - mesh_min_up + 0.01 * scale_factor
+# Hardcoded corrected position (stage units = cm, Y-up); identity orientation.
+PHANTOM_TRANSLATE = (-32.84084072495667, 62.88815390170322, -17.75986671447754)
+
+table_top = max_pt[axis_index]  # still needed for camera framing below
 
 phantom_xf = UsdGeom.Xformable(phantom)
 set_xform(
     phantom,
-    translate=phantom_pos,
+    translate=PHANTOM_TRANSLATE,
+    orient=Gf.Quatf(1, Gf.Vec3f(0, 0, 0)),
     scale=(scale_factor, scale_factor, scale_factor),
 )
 
-print(f"Phantom placed at {phantom_pos}")
+print(f"Phantom placed at {PHANTOM_TRANSLATE}")
 
 # --- Frame the camera on the table ---
 camera_prim = stage.GetPrimAtPath("/OmniverseKit_Persp")
