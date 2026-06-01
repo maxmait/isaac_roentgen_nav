@@ -67,12 +67,15 @@ CT_FULL_VOLUME = os.environ.get("CT_FULL_VOLUME", "0") == "1"
 CACHE_DIR_CT = IO_DIR / ("fluorosim_cache_ct_full" if CT_FULL_VOLUME else "fluorosim_cache_ct")
 
 # Tool abstraction: dense sphere centered at the EE position.
-# - μ ≈ 0.5 mm⁻¹ is ~28× bone (~0.018) and makes the tool effectively opaque to
-#   X-rays (line-integral over a 30 mm chord ≈ 15 nepers → exp(−15) ≈ 0).
+# - μ ≈ 0.3 mm⁻¹ is approximately stainless-steel linear attenuation at ~60 keV
+#   fluoroscopy energies; ~6× cortical bone (~0.05). The line-integral over a
+#   30 mm chord ≈ 9 nepers → exp(−9) ≈ 1e-4, so the tool is effectively opaque.
+#   Matches the constant used by register_phantom_multiview.py for the
+#   registration-target tool sphere.
 # - 15 mm radius gives a ~30 mm-diameter blob, projecting to ~120 px at the
 #   detector under the default geometry (SDD/SID = 2, pixel_spacing = 0.5 mm).
 TOOL_RADIUS_MM: float = 15.0
-TOOL_MU_PER_MM: float = 0.5
+TOOL_MU_PER_MM: float = 0.3
 
 
 def quat_wxyz_to_euler_xyz(w: float, x: float, y: float, z: float) -> tuple[float, float, float]:

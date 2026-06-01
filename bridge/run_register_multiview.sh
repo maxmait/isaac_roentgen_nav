@@ -16,6 +16,13 @@
 #   USE_POSE_JSON   set to 0 to ignore pose.json                (default 1)
 #   DICOM_PATH      host path to a DICOM CT dir; when set, use real CT
 #                   instead of the synthetic ellipsoid phantom
+#   TOOL_IN_TARGET  paint EE tool blob into the registration target DRR
+#                   and mask its pixels out of the loss            (default 1)
+#                   Auto-disabled when pose.json has no ee_pos.
+#   TOOL_MU_PER_MM  tool linear attenuation                       (default 0.3,
+#                                                                  ~steel @ 60 keV)
+#   TOOL_RADIUS_MM  tool sphere radius                            (default 15)
+#   TOOL_MASK_THRESH occlusion threshold for tool mask            (default 0.1)
 #
 # Usage:
 #   ~/isaac_projects/bridge/run_register_multiview.sh
@@ -36,7 +43,7 @@ fi
 mkdir -p "${HOST_IO_DIR}/registration_multiview"
 
 DOCKER_ENV_ARGS=()
-for v in VIEWS_DEG_Y INIT_OFFSET_MM INIT_ROT_DEG LR_MM LR_ROT_RAD ROT_GRAD_CLIP N_ITERS LOG_EVERY USE_POSE_JSON USE_CARM_ROTATION CT_FULL_VOLUME CT_CROP_CENTER_ZYX; do
+for v in VIEWS_DEG_Y INIT_OFFSET_MM INIT_ROT_DEG LR_MM LR_ROT_RAD ROT_GRAD_CLIP N_ITERS LOG_EVERY USE_POSE_JSON USE_CARM_ROTATION CT_FULL_VOLUME CT_CROP_CENTER_ZYX TOOL_IN_TARGET TOOL_RADIUS_MM TOOL_MU_PER_MM TOOL_MASK_THRESH; do
     if [[ -n "${!v:-}" ]]; then
         DOCKER_ENV_ARGS+=("-e" "${v}=${!v}")
     fi

@@ -178,26 +178,50 @@ def main() -> int:
         clipped = np.clip(log, p2, p98)
         return (clipped - p2) / max(p98 - p2, 1e-9)
 
-    fig2, axes2 = plt.subplots(len(views), 3, figsize=(13, 4.5 * len(views)),
+    tool_in_target = bool(summary.get("tool_in_target", False))
+    n_cols = 4 if tool_in_target else 3
+    fig2, axes2 = plt.subplots(len(views), n_cols,
+                                figsize=(4.3 * n_cols, 4.5 * len(views)),
                                 squeeze=False)
     for vi, view in enumerate(views):
         target = np.load(REG_DIR / f"target_{view['name']}.npy")
         recovered = np.load(REG_DIR / f"recovered_{view['name']}.npy")
         diff = np.abs(target - recovered)
 
+        # When the tool is painted into BOTH target and recovered, the diff
+        # in the tool region collapses at convergence (tool position recovered
+        # ≈ GT). The masked-out region was excluded from the loss but the
+        # |diff| image still shows it for visual confirmation.
         t_disp = _window(target)
         r_disp = _window(recovered)
-        panels = [(t_disp,    "target",                     "gray"),
-                  (r_disp,    "recovered",                  "gray"),
+        panels = [(t_disp,    "target (with tool)" if tool_in_target else "target",
+                              "gray"),
+                  (r_disp,    "recovered (with tool)" if tool_in_target else "recovered",
+                              "gray"),
                   (diff,      f"|diff|  max={diff.max():.4f}", "magma")]
+        if tool_in_target:
+            mask = np.load(REG_DIR / f"mask_{view['name']}.npy")
+            # Overlay tool mask outline on the target for clarity.
+            overlay = np.stack([t_disp, t_disp, t_disp], axis=-1)
+            overlay[..., 0] = np.where(mask > 0.5, 1.0, overlay[..., 0])  # red tint
+            overlay[..., 1] = np.where(mask > 0.5, overlay[..., 1] * 0.3,
+                                       overlay[..., 1])
+            overlay[..., 2] = np.where(mask > 0.5, overlay[..., 2] * 0.3,
+                                       overlay[..., 2])
+            panels.append((overlay,
+                           f"tool mask  ({100 * mask.mean():.1f}%)",
+                           None))
         for ax, (img, label, cmap) in zip(axes2[vi], panels):
-            vmin = 0
-            vmax = img.max() if cmap == "magma" else 1.0
-            im = ax.imshow(img, cmap=cmap, vmin=vmin, vmax=vmax)
+            if cmap is None:  # RGB overlay
+                im = ax.imshow(img)
+            else:
+                vmin = 0
+                vmax = img.max() if cmap == "magma" else 1.0
+                im = ax.imshow(img, cmap=cmap, vmin=vmin, vmax=vmax)
+                fig2.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
             ax.set_title(f"{view['name']} ({view['angle_deg_y']:+.0f}°) — {label}",
                          fontsize=10)
             ax.axis("off")
-            fig2.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     fig2.tight_layout()
     fig2.savefig(IMAGES_PNG, dpi=120, bbox_inches="tight")
     print(f"Saved {IMAGES_PNG}")

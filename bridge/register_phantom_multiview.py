@@ -68,6 +68,8 @@ IO_DIR = Path("/workspace/io")
 CACHE_DIR = IO_DIR / "fluorosim_cache"
 OUT_DIR = IO_DIR / "registration_multiview"
 POSE_FILE = IO_DIR / "pose.json"
+TOOL_STAMP_NPY  = IO_DIR / "tool_stamp.npy"
+TOOL_STAMP_META = IO_DIR / "tool_stamp.json"
 
 DICOM_PATH = os.environ.get("DICOM_PATH")
 CT_FULL_VOLUME = os.environ.get("CT_FULL_VOLUME", "0") == "1"
@@ -98,6 +100,18 @@ def _env_views_deg(default: tuple[float, ...]) -> tuple[float, ...]:
 # view disambiguates it — verified: blind 28mm start → 0.003mm/0.000°.
 VIEWS_DEG_Y: tuple[float, ...] = _env_views_deg((0.0, 45.0, 90.0))
 USE_CARM_ROTATION = bool(int(os.environ.get("USE_CARM_ROTATION", "0")))
+
+# Tool-in-target-DRR (clinical realism, Phase 5j follow-up).
+# Paints a dense sphere into the μ-volume at the EE voxel to simulate a
+# metallic surgical tool occluding the anatomy.  Tool pixels are masked
+# out of the registration loss (the optimiser sees only anatomy), so the
+# tool is purely visual occlusion — clinically realistic but does not
+# bias the recovered pose.  μ ≈ 0.3 mm⁻¹ is approximate stainless-steel
+# linear attenuation at ~60 keV; r = 15 mm gives a ~30 mm tool tip blob.
+TOOL_RADIUS_MM   = _envf("TOOL_RADIUS_MM",   15.0)
+TOOL_MU_PER_MM   = _envf("TOOL_MU_PER_MM",   0.3)
+TOOL_MASK_THRESH = _envf("TOOL_MASK_THRESH", 0.5)  # occlusion cutoff (0=any, 1=full)
+TOOL_IN_TARGET   = bool(int(os.environ.get("TOOL_IN_TARGET", "1")))
 
 INIT_OFFSET_MM  = _envv("INIT_OFFSET_MM",  (15.0, -10.0, 8.0))
 INIT_ROT_DEG    = _envv("INIT_ROT_DEG",    (5.0, 0.0, 3.0))
@@ -184,6 +198,203 @@ def quat_wxyz_to_euler_zxy(w: float, x: float, y: float, z: float) -> np.ndarray
     return np.array([rx, ry, rz], dtype=np.float32)
 
 
+# ─── tool painting helpers ───────────────────────────────────────────────────
+
+def ee_voxel_zyx_index(
+    ee_pos_world_m,
+    phantom_pos_world_m,
+    R_phantom_world: np.ndarray,    # 3×3 world-frame rotation
+    spacing_zyx_mm,
+    volume_shape_zyx,
+) -> np.ndarray:
+    """Fractional (z, y, x) voxel index of the EE in the phantom volume frame.
+
+    Accounts for non-identity phantom rotation:
+        offset_world  = (EE − phantom) * 1000          mm in world XYZ
+        offset_local  = R_phantom.T @ offset_world      mm in phantom-local XYZ
+        offset_zyx    = permute(x,y,z → z,y,x)          axis order for volume
+    """
+    offset_world_xyz_mm = (
+        np.asarray(ee_pos_world_m, dtype=np.float64)
+        - np.asarray(phantom_pos_world_m, dtype=np.float64)
+    ) * 1000.0
+    # Matches the rendering math: t_eff = R_phantom.T @ t_world.
+    offset_local_xyz_mm = R_phantom_world.T @ offset_world_xyz_mm
+    offset_local_zyx_mm = offset_local_xyz_mm[[2, 1, 0]]
+    center_voxel = (np.asarray(volume_shape_zyx, dtype=np.float64) - 1.0) / 2.0
+    return center_voxel + offset_local_zyx_mm / np.asarray(spacing_zyx_mm, dtype=np.float64)
+
+
+def quat_wxyz_to_matrix(q) -> np.ndarray:
+    """Unit quaternion (w, x, y, z) → 3×3 column-vector rotation matrix.
+
+    Matches the convention used elsewhere in this file (euler_zxy_to_matrix
+    returns a column-vector R such that v_world_col = R @ v_local_col).
+    """
+    w, x, y, z = q
+    n = w * w + x * x + y * y + z * z
+    s = 2.0 / n if n > 0 else 0.0
+    return np.array([
+        [1 - s*(y*y + z*z),     s*(x*y - z*w),     s*(x*z + y*w)],
+        [    s*(x*y + z*w), 1 - s*(x*x + z*z),     s*(y*z - x*w)],
+        [    s*(x*z - y*w),     s*(y*z + x*w), 1 - s*(x*x + y*y)],
+    ], dtype=np.float64)
+
+
+def load_tool_stamp() -> dict | None:
+    """Load the EE-local tool stamp built by bridge/build_tool_stamp.py.
+
+    Returns None when the stamp files are absent (the pipeline then falls
+    back to the sphere painter).
+    """
+    if not TOOL_STAMP_NPY.exists() or not TOOL_STAMP_META.exists():
+        return None
+    stamp = np.load(TOOL_STAMP_NPY).astype(np.float32)
+    with open(TOOL_STAMP_META) as f:
+        meta = json.load(f)
+    return {
+        "stamp":           stamp,                      # (nz, ny, nx)
+        "spacing_zyx_mm":  np.asarray(meta["spacing_zyx_mm"], dtype=np.float64),
+        "origin_xyz_mm":   np.asarray(meta["origin_ee_local_xyz_mm"], dtype=np.float64),
+        "tool_mu_per_mm":  float(meta["tool_mu_per_mm"]),
+        "meta":            meta,
+    }
+
+
+def paint_stamp_into_mu(
+    mu: np.ndarray,                # phantom μ-volume (Z, Y, X)
+    spacing_zyx_mm,
+    ee_pos_world_m,                # (3,) world frame, metres
+    ee_quat_wxyz,                  # (4,)
+    phantom_pos_world_m,
+    R_phantom_world: np.ndarray,   # 3×3 column-vector form
+    stamp_info: dict,
+) -> tuple[np.ndarray, int]:
+    """Splat the EE-local tool stamp into a COPY of mu via affine resampling.
+
+    The transform (ph_idx → st_idx) is fully linear:
+        v_ph_zyx_mm = (ph_idx - ph_center) * ph_spacing_zyx_mm
+        v_ph_xyz_mm = P @ v_ph_zyx_mm                       # permute zyx→xyz
+        v_world_mm  = R_phantom_world @ v_ph_xyz_mm + phantom_pos_mm
+        v_ee_xyz    = R_ee_world.T @ (v_world_mm - ee_pos_mm)
+        v_ee_zyx    = P @ v_ee_xyz                          # permute xyz→zyx
+        st_idx      = (v_ee_zyx - stamp_origin_zyx_mm) / stamp_spacing_zyx
+                      − 0.5                                  # voxel-corner→idx
+    scipy.ndimage.affine_transform samples
+        output[ph_idx] = stamp[ M @ ph_idx + b ]
+    so we just expand the chain into (M, b).  An AABB of the stamp is
+    computed in phantom voxel space so we resample only the relevant
+    subvolume — much faster than touching the whole μ-volume.
+
+    Tool μ is `max`-combined with anatomy μ (the steel tool occludes any
+    bone/tissue it overlaps).  Returns (mu_modified, n_voxels_painted).
+    """
+    from scipy.ndimage import affine_transform
+
+    stamp           = stamp_info["stamp"]
+    stamp_origin    = stamp_info["origin_xyz_mm"]               # (3,) EE-local xyz mm
+    stamp_spacing   = stamp_info["spacing_zyx_mm"]              # (3,) zyx mm
+    R_ee_world      = quat_wxyz_to_matrix(ee_quat_wxyz)         # 3×3 col-vec
+
+    ph_shape   = np.asarray(mu.shape, dtype=np.float64)
+    ph_center  = (ph_shape - 1.0) / 2.0
+    ph_spacing = np.asarray(spacing_zyx_mm, dtype=np.float64)
+
+    phantom_pos_mm = np.asarray(phantom_pos_world_m, dtype=np.float64) * 1000.0
+    ee_pos_mm      = np.asarray(ee_pos_world_m, dtype=np.float64) * 1000.0
+    P = np.array([[0, 0, 1], [0, 1, 0], [1, 0, 0]], dtype=np.float64)
+    stamp_origin_zyx = P @ stamp_origin                           # EE-local zyx mm
+
+    A         = np.diag(ph_spacing)
+    D_st_inv  = np.diag(1.0 / stamp_spacing)
+    M         = D_st_inv @ P @ R_ee_world.T @ R_phantom_world @ P @ A
+    v_ee_zyx_at_phc = P @ (R_ee_world.T @ (phantom_pos_mm - ee_pos_mm))
+    st_idx_at_phc   = D_st_inv @ (v_ee_zyx_at_phc - stamp_origin_zyx) - 0.5
+    b = st_idx_at_phc - M @ ph_center
+
+    # AABB of the stamp's 8 corners in phantom voxel space (xyz → zyx permutes done explicitly)
+    stamp_shape_zyx  = np.asarray(stamp.shape, dtype=np.float64)
+    stamp_extent_zyx = (stamp_shape_zyx - 1.0) * stamp_spacing
+    stamp_extent_xyz = stamp_extent_zyx[[2, 1, 0]]
+    corners_xyz = np.array(
+        [stamp_origin + np.array([cx, cy, cz])
+         for cz in (0.0, stamp_extent_xyz[2])
+         for cy in (0.0, stamp_extent_xyz[1])
+         for cx in (0.0, stamp_extent_xyz[0])],
+        dtype=np.float64,
+    )                                                             # (8, 3) EE-local xyz mm
+    corners_world  = (R_ee_world @ corners_xyz.T).T + ee_pos_mm
+    corners_ph_xyz = (R_phantom_world.T @ (corners_world - phantom_pos_mm).T).T
+    corners_ph_zyx = corners_ph_xyz[:, [2, 1, 0]]
+    corners_idx    = corners_ph_zyx / ph_spacing + ph_center
+
+    aabb_min = np.maximum(np.floor(corners_idx.min(axis=0)).astype(int), 0)
+    aabb_max = np.minimum(np.ceil(corners_idx.max(axis=0)).astype(int) + 1,
+                          np.asarray(mu.shape, dtype=int))
+    if np.any(aabb_max <= aabb_min):
+        return mu.copy(), 0
+
+    aabb_shape  = (aabb_max - aabb_min).astype(int)
+    sub_offset  = M @ aabb_min.astype(np.float64) + b
+    sub_stamp   = affine_transform(
+        stamp.astype(np.float32),
+        M, offset=sub_offset,
+        output_shape=tuple(int(s) for s in aabb_shape),
+        order=1, mode="constant", cval=0.0, prefilter=False,
+    )
+
+    mu_out = mu.copy()
+    sub = mu_out[aabb_min[0]:aabb_max[0],
+                  aabb_min[1]:aabb_max[1],
+                  aabb_min[2]:aabb_max[2]]
+    np.maximum(sub, sub_stamp, out=sub)
+    n_painted = int((sub_stamp > 1e-6).sum())
+    return mu_out, n_painted
+
+
+def paint_sphere_into_mu(
+    mu: np.ndarray,
+    ee_voxel: np.ndarray,
+    spacing_zyx_mm,
+    radius_mm: float,
+    tool_mu: float,
+) -> tuple[np.ndarray, int, bool]:
+    """Burn an isotropic sphere of high μ into a COPY of `mu`.
+
+    Tool voxels are SET to tool_mu (not added) — a metal tool literally
+    replaces the surrounding voxel content. Returns (mu_modified, n_painted,
+    fully_inside).
+    """
+    mu_out = mu.copy()
+    spacing = np.asarray(spacing_zyx_mm, dtype=np.float64)
+    shape = np.asarray(mu.shape, dtype=np.int64)
+    radius_vox = radius_mm / spacing
+    fully_inside = bool(
+        np.all(ee_voxel - radius_vox >= 0)
+        and np.all(ee_voxel + radius_vox <= shape - 1)
+    )
+    bb_min = np.maximum(np.zeros(3, dtype=np.int64),
+                        np.floor(ee_voxel - radius_vox).astype(np.int64))
+    bb_max = np.minimum(shape,
+                        (np.ceil(ee_voxel + radius_vox) + 1).astype(np.int64))
+    if np.any(bb_max <= bb_min):
+        return mu_out, 0, fully_inside
+
+    z = np.arange(bb_min[0], bb_max[0])
+    y = np.arange(bb_min[1], bb_max[1])
+    x = np.arange(bb_min[2], bb_max[2])
+    zz, yy, xx = np.meshgrid(z, y, x, indexing="ij")
+    dist_sq_mm = (
+        ((zz - ee_voxel[0]) * spacing[0]) ** 2
+        + ((yy - ee_voxel[1]) * spacing[1]) ** 2
+        + ((xx - ee_voxel[2]) * spacing[2]) ** 2
+    )
+    mask = dist_sq_mm <= radius_mm ** 2
+    sub = mu_out[bb_min[0]:bb_max[0], bb_min[1]:bb_max[1], bb_min[2]:bb_max[2]]
+    sub[mask] = tool_mu
+    return mu_out, int(mask.sum()), fully_inside
+
+
 def geodesic_angle_deg(R1: np.ndarray, R2: np.ndarray) -> float:
     """Geodesic rotation distance between two rotation matrices, in degrees."""
     R_rel = R1.T @ R2
@@ -213,12 +424,16 @@ def load_isaac_ground_truth() -> dict | None:
     phantom_quat = pose.get("phantom_quat", [1.0, 0.0, 0.0, 0.0])
     gt_translation_mm = (carm_pos - phantom_pos) * 1000.0
     gt_phantom_rot_euler = quat_wxyz_to_euler_zxy(*phantom_quat)
+    ee_pos = pose.get("ee_pos")    # for tool painting; None in synthetic mode
+    ee_quat = pose.get("ee_quat")   # for oriented tool stamp
     return {
         "phantom_pos_world_m":    phantom_pos.tolist(),
         "carm_pos_world_m":       carm_pos.tolist(),
         "gt_translation_mm":      gt_translation_mm.tolist(),
         "gt_phantom_rot_euler":   gt_phantom_rot_euler.tolist(),
         "phantom_quat_wxyz":      phantom_quat,
+        "ee_pos_world_m":         ee_pos,
+        "ee_quat_wxyz":           ee_quat,
     }
 
 
@@ -332,9 +547,73 @@ def main() -> int:
         normalize=True, invert=True,
     )
 
-    # --- Target images (rendered at GT pose) ---------------------------------
+    # --- Tool painting (Phase 5 follow-up: tool-in-target-DRR) ---------------
+    # Burn a dense sphere into the μ-volume at the EE voxel so the TARGET
+    # images contain a metallic occlusion — matching what a real fluoroscope
+    # would record with the tool inserted. A separate tool-only volume is
+    # rendered per view to derive a binary mask; the registration loss is
+    # weighted by (1 - mask), so the tool's pixels carry no signal and the
+    # optimiser only matches anatomy. The optimiser's own renderer keeps the
+    # clean μ-volume (no tool) — clinically correct: the patient's CT does
+    # not contain an inserted tool.
+    ee_pos_world = isaac.get("ee_pos_world_m") if isaac is not None else None
+    ee_quat_world = (isaac.get("ee_quat_wxyz") if isaac is not None else None)
+    paint_tool = TOOL_IN_TARGET and ee_pos_world is not None
+    tool_stamp_info = load_tool_stamp() if paint_tool else None
+    use_stamp = tool_stamp_info is not None and ee_quat_world is not None
+    if paint_tool:
+        R_phantom_gt_np = euler_zxy_to_matrix(
+            torch.tensor(gt_phantom_rot_euler, dtype=torch.float32)
+        ).numpy().astype(np.float64)
+        ee_voxel_gt = ee_voxel_zyx_index(
+            ee_pos_world, isaac["phantom_pos_world_m"], R_phantom_gt_np,
+            spacing, mu.shape,
+        )
+        if use_stamp:
+            stamp_shape = tool_stamp_info["stamp"].shape
+            print(f"\n[1b] Painting tool MESH STAMP into target volume "
+                  f"(stamp shape {stamp_shape}, μ={tool_stamp_info['tool_mu_per_mm']:.3f} mm⁻¹)")
+            print(f"  EE world pos (m):      {ee_pos_world}")
+            print(f"  EE world quat (wxyz):  {ee_quat_world}")
+            print(f"  EE voxel (GT z,y,x):   "
+                  f"({ee_voxel_gt[0]:.1f}, {ee_voxel_gt[1]:.1f}, {ee_voxel_gt[2]:.1f})")
+            mu_target, n_painted = paint_stamp_into_mu(
+                mu, spacing, ee_pos_world, ee_quat_world,
+                isaac["phantom_pos_world_m"], R_phantom_gt_np, tool_stamp_info,
+            )
+            mu_tool_only, _ = paint_stamp_into_mu(
+                np.zeros_like(mu), spacing, ee_pos_world, ee_quat_world,
+                isaac["phantom_pos_world_m"], R_phantom_gt_np, tool_stamp_info,
+            )
+            print(f"  Painted {n_painted} voxels  "
+                  f"(source mesh: {tool_stamp_info['meta'].get('source_mesh_meta', {}).get('mesh_prim', '?')})")
+        else:
+            print(f"\n[1b] Painting tool SPHERE into target volume "
+                  f"(μ={TOOL_MU_PER_MM:.3f} mm⁻¹, r={TOOL_RADIUS_MM:.1f} mm)")
+            print(f"  EE world pos (m):      {ee_pos_world}")
+            print(f"  EE voxel (GT z,y,x):   "
+                  f"({ee_voxel_gt[0]:.1f}, {ee_voxel_gt[1]:.1f}, {ee_voxel_gt[2]:.1f})")
+            mu_target, n_painted, fully_inside = paint_sphere_into_mu(
+                mu, ee_voxel_gt, spacing, TOOL_RADIUS_MM, TOOL_MU_PER_MM,
+            )
+            mu_tool_only, _, _ = paint_sphere_into_mu(
+                np.zeros_like(mu), ee_voxel_gt, spacing,
+                TOOL_RADIUS_MM, TOOL_MU_PER_MM,
+            )
+            print(f"  Painted {n_painted} voxels  (fully inside volume: {fully_inside})")
+    else:
+        if isaac is None:
+            print("\n[1b] No pose.json → no EE position → tool painting disabled")
+        elif ee_pos_world is None:
+            print("\n[1b] pose.json missing 'ee_pos' field → tool painting disabled")
+        else:
+            print("\n[1b] TOOL_IN_TARGET=0 → tool painting disabled")
+        mu_target = mu
+        mu_tool_only = None
+
+    # --- Target images (rendered at GT pose, with tool painted in) -----------
     print("\n[2] Simulating OR workflow — taking each shot in sequence...")
-    target_renderer = SlangDiffDRRRenderer(mu, spacing, cfg)
+    target_renderer = SlangDiffDRRRenderer(mu_target, spacing, cfg)
     _ = target_renderer.render((0.0, 0.0, 0.0), (0.0, 0.0, 0.0))  # JIT warmup
 
     # Compute GT effective rotation/translation per view (accounts for phantom rotation)
@@ -343,16 +622,59 @@ def main() -> int:
     R_phantom_gt = euler_zxy_to_matrix(gt_rot_t)  # no grad needed here
 
     targets_np: list[np.ndarray] = []
+    per_view_eff_geom: list[tuple[tuple[float, float, float], tuple[float, float, float]]] = []
     for view in views:
         R_gantry = euler_zxy_to_matrix(
             torch.tensor(view["rotation_rad"], dtype=torch.float32)
         )
-        t_eff_gt = (R_phantom_gt.T @ gt_trans_t).tolist()
-        r_eff_gt = matrix_to_euler_zxy(R_phantom_gt.T @ R_gantry).tolist()
-        img = target_renderer.render(tuple(r_eff_gt), tuple(t_eff_gt))
+        t_eff_gt = tuple((R_phantom_gt.T @ gt_trans_t).tolist())
+        r_eff_gt = tuple(matrix_to_euler_zxy(R_phantom_gt.T @ R_gantry).tolist())
+        per_view_eff_geom.append((r_eff_gt, t_eff_gt))
+        img = target_renderer.render(r_eff_gt, t_eff_gt)
         targets_np.append(img)
         print(f"  [{view['name']:>8}] ry={view['angle_deg']:+.1f}°  "
               f"range=[{img.min():.4f}, {img.max():.4f}]  std={img.std():.4f}")
+
+    # --- Per-view tool masks (rendered from the tool-only μ-volume) ----------
+    # Rendered with normalize=False + invert=False — the renderer's output
+    # is then transmittance T = exp(−∫μ dl):
+    #   air rays (integral = 0)             → T ≈ 1
+    #   tool centre (integral ≈ 9 nepers)   → T ≈ 1.2e−4 ≈ 0
+    # The tool's occlusion = 1 − T.  A pixel is "in the tool's shadow" when
+    # T < some threshold (equivalently occlusion > 1 − threshold).
+    # TOOL_MASK_THRESH expresses the OCCLUSION cutoff (default 0.5 → mask
+    # pixels whose chord through the tool absorbs at least 50% of the beam,
+    # i.e. transmittance < 0.5 → chord ≥ ln(2)/μ ≈ 2.3 mm at μ=0.3).
+    masks_np: list[np.ndarray] = []
+    if paint_tool:
+        print("\n[2b] Building per-view tool masks (rendering tool-only volume)...")
+        mask_cfg = SlangDiffDRRConfig(
+            det_height_px=cfg.det_height_px, det_width_px=cfg.det_width_px,
+            pixel_spacing_mm=cfg.pixel_spacing_mm,
+            source_to_detector_mm=cfg.source_to_detector_mm,
+            source_to_isocenter_mm=cfg.source_to_isocenter_mm,
+            step_mm=cfg.step_mm,
+            normalize=False, invert=False,
+        )
+        mask_renderer = SlangDiffDRRRenderer(mu_tool_only, spacing, mask_cfg)
+        _ = mask_renderer.render((0.0, 0.0, 0.0), (0.0, 0.0, 0.0))
+        for view, (r_eff_gt, t_eff_gt) in zip(views, per_view_eff_geom):
+            transmittance = mask_renderer.render(r_eff_gt, t_eff_gt)
+            occlusion = 1.0 - transmittance
+            mask = (occlusion > TOOL_MASK_THRESH).astype(np.float32)
+            masks_np.append(mask)
+            frac = 100.0 * mask.mean()
+            print(f"  [{view['name']:>8}] tool mask: {int(mask.sum())} of "
+                  f"{mask.size} pixels ({frac:.2f}%, "
+                  f"max occlusion={float(occlusion.max()):.3f}, "
+                  f"thresh={TOOL_MASK_THRESH:.2f})")
+        del mask_renderer  # free GPU volume; we won't need it again
+        mu_tool_only = None
+    else:
+        for view in views:
+            h, w = targets_np[0].shape[:2]
+            masks_np.append(np.zeros((h, w), dtype=np.float32))
+    del target_renderer  # the optimiser uses its own renderer (clean μ)
 
     # --- Optimizer setup -----------------------------------------------------
     # Blind init: start from C-arm isocenter + planning offset, no GT knowledge.
@@ -386,6 +708,17 @@ def main() -> int:
         for view in views
     ]
     targets = [torch.from_numpy(t).to(translation.device) for t in targets_np]
+    # Anatomy-only weighting for the loss: 0 inside the tool footprint, 1 elsewhere.
+    # When paint_tool is False all masks are zero → weights are all-1 → identical
+    # to the pre-masking behaviour.
+    weights = [
+        (1.0 - torch.from_numpy(m).to(translation.device)) for m in masks_np
+    ]
+    weight_norms = [w.sum().clamp(min=1.0) for w in weights]
+    if paint_tool:
+        anatomy_fracs = [float(w.mean().item()) for w in weights]
+        print(f"  Mask-aware loss enabled (anatomy fraction per view: "
+              f"{[round(f, 3) for f in anatomy_fracs]})")
 
     init_trans_err = init_trans - np.asarray(gt_translation_mm, dtype=np.float32)
     init_rot_err_deg = np.degrees(init_rot) - np.degrees(np.asarray(gt_phantom_rot_euler, dtype=np.float32))
@@ -417,12 +750,15 @@ def main() -> int:
         R_ph = euler_zxy_to_matrix(phantom_rot)
         t_world = translation  # world-frame displacement (mm)
 
-        for rot_gantry, target in zip(rot_gantry_tensors, targets):
+        for rot_gantry, target, weight, w_norm in zip(
+            rot_gantry_tensors, targets, weights, weight_norms
+        ):
             R_eff    = R_ph.T @ euler_zxy_to_matrix(rot_gantry)
             euler_eff = matrix_to_euler_zxy(R_eff)
             t_eff    = R_ph.T @ t_world
             rendered = drr_module(euler_eff, t_eff)
-            loss_v   = ((rendered - target) ** 2).mean()
+            # Mask-weighted MSE over anatomy pixels only (tool footprint = 0).
+            loss_v   = (((rendered - target) ** 2) * weight).sum() / w_norm
             total_loss = total_loss + loss_v
             per_view_loss.append(float(loss_v.item()))
 
@@ -485,15 +821,58 @@ def main() -> int:
     R_ph_final = euler_zxy_to_matrix(
         torch.tensor(final_rot_np, dtype=torch.float32)
     )
-    for rot_gantry, view in zip(rot_gantry_tensors, views):
-        with torch.no_grad():
-            R_eff    = R_ph_final.T @ euler_zxy_to_matrix(rot_gantry)
-            euler_eff = matrix_to_euler_zxy(R_eff)
-            t_eff    = R_ph_final.T @ translation
-            recovered_np.append(drr_module(euler_eff, t_eff).cpu().numpy())
-        np.save(OUT_DIR / f"target_{view['name']}.npy",
-                targets_np[len(recovered_np) - 1])
-        np.save(OUT_DIR / f"recovered_{view['name']}.npy", recovered_np[-1])
+
+    # For the recovered images, paint the tool at the RECOVERED EE voxel so
+    # the plotted DRR shows the tool in the position the registration places
+    # it. At convergence this matches the GT position in the target DRR.
+    # We render through an extra renderer; the optimiser's drr_module is
+    # not used here because it carries the clean μ-volume.
+    if paint_tool:
+        R_phantom_recov_np = R_ph_final.numpy().astype(np.float64)
+        carm_world_np = np.asarray(isaac["carm_pos_world_m"], dtype=np.float64)
+        phantom_pos_recov_m = carm_world_np - final_trans_mm.astype(np.float64) / 1000.0
+        ee_voxel_recov = ee_voxel_zyx_index(
+            ee_pos_world, phantom_pos_recov_m, R_phantom_recov_np,
+            spacing, mu.shape,
+        )
+        print(f"  EE voxel (recov z,y,x): "
+              f"({ee_voxel_recov[0]:.1f}, {ee_voxel_recov[1]:.1f}, {ee_voxel_recov[2]:.1f})  "
+              f"Δ vs GT = "
+              f"({ee_voxel_recov[0] - ee_voxel_gt[0]:+.2f}, "
+              f"{ee_voxel_recov[1] - ee_voxel_gt[1]:+.2f}, "
+              f"{ee_voxel_recov[2] - ee_voxel_gt[2]:+.2f}) voxels")
+        if use_stamp:
+            mu_recov, _ = paint_stamp_into_mu(
+                mu, spacing, ee_pos_world, ee_quat_world,
+                phantom_pos_recov_m, R_phantom_recov_np, tool_stamp_info,
+            )
+        else:
+            mu_recov, _, _ = paint_sphere_into_mu(
+                mu, ee_voxel_recov, spacing, TOOL_RADIUS_MM, TOOL_MU_PER_MM,
+            )
+        recov_renderer = SlangDiffDRRRenderer(mu_recov, spacing, cfg)
+        _ = recov_renderer.render((0.0, 0.0, 0.0), (0.0, 0.0, 0.0))
+        for rot_gantry, view, mask in zip(rot_gantry_tensors, views, masks_np):
+            with torch.no_grad():
+                R_eff    = R_ph_final.T @ euler_zxy_to_matrix(rot_gantry)
+                euler_eff = tuple(matrix_to_euler_zxy(R_eff).tolist())
+                t_eff    = tuple((R_ph_final.T @ translation).tolist())
+            recovered_np.append(recov_renderer.render(euler_eff, t_eff))
+            np.save(OUT_DIR / f"target_{view['name']}.npy",
+                    targets_np[len(recovered_np) - 1])
+            np.save(OUT_DIR / f"recovered_{view['name']}.npy", recovered_np[-1])
+            np.save(OUT_DIR / f"mask_{view['name']}.npy", mask)
+        del recov_renderer
+    else:
+        for rot_gantry, view in zip(rot_gantry_tensors, views):
+            with torch.no_grad():
+                R_eff    = R_ph_final.T @ euler_zxy_to_matrix(rot_gantry)
+                euler_eff = matrix_to_euler_zxy(R_eff)
+                t_eff    = R_ph_final.T @ translation
+                recovered_np.append(drr_module(euler_eff, t_eff).cpu().numpy())
+            np.save(OUT_DIR / f"target_{view['name']}.npy",
+                    targets_np[len(recovered_np) - 1])
+            np.save(OUT_DIR / f"recovered_{view['name']}.npy", recovered_np[-1])
 
     final_rot_mat = R_ph_final.numpy().astype(np.float64)
     final_rot_quat = rotation_matrix_to_quat_wxyz(final_rot_mat)
@@ -523,6 +902,24 @@ def main() -> int:
         "lr_mm":     LR_MM,
         "lr_rot_rad": LR_ROT_RAD,
         "wall_seconds": elapsed,
+        "tool_in_target": bool(paint_tool),
+        "tool_shape": ("mesh_stamp" if (paint_tool and use_stamp)
+                       else ("sphere" if paint_tool else "none")),
+        "tool_params": {
+            "radius_mm":      TOOL_RADIUS_MM,
+            "mu_per_mm":      TOOL_MU_PER_MM,
+            "mask_threshold": TOOL_MASK_THRESH,
+            "ee_pos_world_m": ee_pos_world if paint_tool else None,
+            "ee_quat_world_wxyz": ee_quat_world if paint_tool else None,
+            "stamp_source":      (tool_stamp_info["meta"].get("source_mesh_meta", {}).get("mesh_prim")
+                                  if (paint_tool and use_stamp) else None),
+            "ee_voxel_gt_zyx":   ee_voxel_gt.tolist() if paint_tool else None,
+            "ee_voxel_recov_zyx": ee_voxel_recov.tolist() if paint_tool else None,
+            "anatomy_fraction_per_view": (
+                [float((1.0 - torch.from_numpy(m)).mean().item())
+                 for m in masks_np] if paint_tool else None
+            ),
+        },
         "trace": trace,
     }
 
