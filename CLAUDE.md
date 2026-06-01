@@ -52,6 +52,8 @@ using simulated fluoroscopy (DRR) and 2D/3D CT registration — entirely in soft
     rotate_carm.py                 # TCP-injected: rotate C-arm around patient long axis
     add_carm_shot.py               # TCP-injected: append C-arm angle to view_angles_deg
     capture_two_shots.py           # TCP-injected: timed two-shot capture (GUI manipulator)
+    extract_tool_mesh.py           # Phase 5m: TCP-injected — extract endo360 tip mesh from
+                                   # the live scene into EE-local frame (tool_mesh.*.npy)
     snapshots/                     # runtime viewport snapshots (gitignored)
   bridge/                          # fluorosim side (Docker-bound scripts + wrappers)
     fluorosim_render.py            # runs INSIDE the container; reads pose.json, renders DRR
@@ -64,6 +66,8 @@ using simulated fluoroscopy (DRR) and 2D/3D CT registration — entirely in soft
     register_phantom_multiview.py  # Phase 5: clinical sequential AP + lateral C-arm shots
     run_register_multiview.sh      # docker run wrapper for the multi-view registration
     plot_registration_multiview.py # host-side: per-view losses + per-view target/recovered/diff panels
+    build_tool_stamp.py            # Phase 5m: host-side — voxelize tool_mesh.*.npy via trimesh →
+                                   # output/tool_stamp.{npy,json} (EE-local μ-volume stamp)
     compute_robot_to_anatomy.py    # Phase 5 deliverable: composes registered phantom with EE pose
                                    # → T_R^A, T_R^C, T_A^C + clinical inside/outside check
     ct_loader.py                   # Phase 5d: DICOM CT → PreprocessedVolume (cropped ROI or full)
@@ -425,10 +429,66 @@ needing a separate GUI session.
       reported in both the JSON output and the text summary.
       plot_registration_multiview.py extended to 4 panels — 4th shows per-axis
       rotation error and geodesic norm vs iteration.
-- [ ] Tool in the registration target image — currently the registration
-      renders its target DRR *without* the EE blob (see "Simulation
-      simplifications" in Known Issues).  Adding the tool requires either
-      a tool-masking loss or robust matching; deferred.
+- [x] Phase 5m — real endo360 tip mesh as the DRR tool (replaces the sphere).
+      Three-stage pipeline so the mesh extraction (Isaac Sim), voxelization
+      (host + trimesh), and splatting (Docker container) each run in the
+      environment that has what they need:
+        1. scenes/extract_tool_mesh.py — TCP-injected; reads
+           /World/Robot/endo360_link_1/visuals from the live medical_scene,
+           composes the mesh prim's world transform with the EE prim's world
+           transform (endo360_needle, the TCP) to express the verts in
+           EE-local mm. Writes output/tool_mesh.{verts.npy, faces.npy, json}.
+           Round-trip reconstruction error < 1 µm (verified).
+        2. bridge/build_tool_stamp.py — host-side; voxelizes the mesh with
+           trimesh.contains() (winding-number, robust on non-watertight
+           meshes) at 0.5 mm spacing, multiplies by TOOL_MU_PER_MM. Writes
+           output/tool_stamp.{npy, json}. ~82k voxel grid, ~30k interior
+           voxels for the 12×12×50 mm endo360 tip; 36 s one-time.
+        3. paint_stamp_into_mu() in register_phantom_multiview.py —
+           splats the EE-local stamp into the phantom μ-volume via
+           scipy.ndimage.affine_transform. Builds the full ph_idx → st_idx
+           affine (M, b) from ee_pos/ee_quat (pose.json), phantom_pos/quat,
+           and the stamp's origin/spacing; computes the tool's AABB in
+           phantom voxel space so resampling touches only that subvolume
+           (~1 cm³ instead of the whole μ-volume). tool μ is max-combined
+           with anatomy μ (steel occludes any tissue it overlaps).
+      Auto-on whenever output/tool_stamp.npy exists; the sphere path is
+      preserved as the fallback. New env: STAMP_SPACING_MM (0.5),
+      STAMP_PAD_MM (1.0).  Plot reads "tool_shape" from the trace and
+      labels the panels accordingly.
+      Verified on live medical_scene + spine CT, blind 19.7 mm / 5.8°
+      start, 3 views (0,45,90), 200 iters: 0.109 mm / 0.020° world error
+      (slightly BETTER than the sphere's 0.217 mm — the real tip's
+      projected footprint is much smaller, so the mask covers ~0.2% per
+      view instead of ~4%, leaving more anatomy signal in the loss).
+      EE voxel recovered to (-0.10, -0.00, -0.01) voxels of GT.
+      The "next-step" use the user flagged (tool-driven DRR↔robot
+      registration) is now unblocked: a tool-only render projected from
+      the same μ-volume gives the tool silhouette in image space, and a
+      gradient against ee_pos/ee_quat could pull the robot pose to match.
+- [x] Phase 5l — tool in the registration target image (clinical realism).
+      register_phantom_multiview.py now paints the EE sphere (μ=0.3 mm⁻¹
+      ≈ steel @ 60 keV, r=15 mm) into the μ-volume at the GT EE voxel before
+      rendering the TARGET DRRs — they show the tool as a dense opaque blob
+      occluding the anatomy, matching a real fluoroscope.  A separate tool-only
+      μ-volume is rendered per view (normalize=False, invert=False → output
+      is transmittance T = exp(−∫μ dl)); occlusion = 1 − T thresholded at
+      TOOL_MASK_THRESH (default 0.5) gives a binary tool mask, ~4% of pixels
+      per view.  The registration loss is (rendered − target)² · (1 − mask),
+      summed and divided by the anatomy pixel count — the optimiser sees only
+      anatomy.  Optimiser renderer keeps the CLEAN μ-volume (the patient's CT
+      has no tool in it — clinically correct).  After optimisation, the
+      "recovered" DRRs are re-rendered with the tool painted at the RECOVERED
+      EE voxel so the saved images show the tool in the position the
+      registration places it (at convergence, identical to GT position to
+      sub-voxel).  Verified on live medical_scene + spine CT, blind 28 mm /
+      5.8° start, 3 views (0,45,90), 200 iters: 0.217 mm / 0.130° final
+      error.  EE voxel recovered to within (−0.09, +0.09, −0.02) voxels of GT.
+      Env vars: TOOL_IN_TARGET (default 1, auto-off if no ee_pos in pose.json),
+      TOOL_MU_PER_MM (0.3), TOOL_RADIUS_MM (15), TOOL_MASK_THRESH (0.5).
+      Also fluorosim_render.py's existing paint_tool_into_volume() μ bumped
+      0.5 → 0.3 for consistency.  plot_registration_multiview.py adds a 4th
+      column per view showing the red tool-mask overlay on the target image.
 - [x] Blind optimiser init — `INIT_OFFSET_MM` is now an absolute starting
       translation from the C-arm isocenter, not an offset from GT.
       GT is read from pose.json for *evaluation only*, never for init.
@@ -517,6 +577,14 @@ needing a separate GUI session.
 | 2026-05-27 | Finding: 2-view 6-DOF has limited blind capture range    | ⚠️ With the honest 28mm blind start, 2 orthogonal views (0°,90°) settled in a tx↔ry coupling local min (~2.06mm / 6.15°) — the +30mm Z was recovered (tz err 0.09mm) but tx drifted +2mm and ry −6° together (in-plane translation↔rotation ambiguity). Independent of INIT_ROT_DEG (drifts to same min from rot=0). GT-leak init had masked this. Fix: add an oblique 3rd view. |
 | 2026-05-27 | Fix: 3rd oblique view (0°,45°,90°) breaks tx↔ry coupling | ✅ Same blind 28mm start → 0.003mm / 0.000° (better than the GT-leak 2-view 0.016mm). Default VIEWS_DEG_Y changed (0,90)→(0,45,90) in register_phantom_multiview.py. ≥3 views (one oblique) now the recommended robust 6-DOF workflow. |
 | 2026-05-27 | Env: nvidia-container-toolkit lost on driver downgrade    | ⚠️ Driver 590→550 (to dodge 595 breaking Isaac Sim) uninstalled nvidia-container-toolkit; docker --gpus failed. Reinstalled toolkit + nvidia-ctk runtime configure. Then driver 550 (CUDA 12.4) < container cuda>=12.6 → REQUIRE check + consumer-GPU forward-compat error 804. Resolved by installing a driver ≥560 (CUDA≥12.6); container then runs unmodified. |
+| 2026-05-30 | Phase 5l: tool in the registration target image (clinical realism) | ✅ register_phantom_multiview.py paints EE sphere (μ=0.3 mm⁻¹ ≈ steel @ 60 keV, r=15mm) into target μ-volume; tool-only renderer (normalize=False, invert=False → transmittance) thresholded at occlusion>0.5 → ~4% tool mask per view. Loss = ((rendered-target)²·(1-mask)).sum()/anatomy_count → optimiser sees only anatomy. Recovered DRRs re-rendered with tool at recovered EE voxel for visualisation. Verified blind 28mm/5.8° start → 0.217mm/0.130° on live medical_scene + spine CT, 3 views (0,45,90), 200 iters. EE voxel recovered to within (-0.09,+0.09,-0.02) of GT. Env: TOOL_IN_TARGET/TOOL_MU_PER_MM/TOOL_RADIUS_MM/TOOL_MASK_THRESH. fluorosim_render.py μ also bumped 0.5→0.3 for consistency. plot_registration_multiview.py adds 4th column = red mask overlay. |
+| 2026-05-30 | Bug: normalize=True post-processing makes the tool-only mask useless | ❌ First attempt rendered the tool-only DRR with the optimiser's normalize=True+invert=True cfg and thresholded the inverted output. The renderer's normalize on a near-empty volume produces non-linear values where >95% of pixels read as "occluded" — the mask covered the whole image. Fixed: separate mask_cfg with normalize=False+invert=False → output is plain transmittance T=exp(-∫μ dl); threshold occlusion=(1-T)>0.5 selects only pixels with ≥50% beam attenuation (matches ~4% projected disk geometry). |
+| 2026-05-30 | Phase 5m: real endo360 tip mesh replaces the sphere in the DRR | ✅ Three-stage pipeline: scenes/extract_tool_mesh.py (TCP, Isaac Sim) → output/tool_mesh.{verts,faces}.npy in EE-local mm; bridge/build_tool_stamp.py (host, trimesh) → output/tool_stamp.{npy,json} (105×28×28 voxel grid at 0.5 mm, 30k interior, 322 KB); paint_stamp_into_mu() in register_phantom_multiview.py splats via scipy.ndimage.affine_transform over an AABB-bounded subvolume. Tool μ max-combined with anatomy μ. Sphere path preserved as fallback. End-to-end: 19.7 mm/5.8° blind → 0.109 mm/0.020° in 200 iters; EE voxel within (-0.10, -0.00, -0.01) of GT. DRRs now show the actual endoscope bullet shape (~0.2% tool mask vs ~4% for sphere → more anatomy signal). |
+| 2026-05-30 | Bug: extract_tool_mesh.py initial code used wrong USD inverse convention | ❌ USD is row-vector form: v_world = v_local @ T. The inverse for v_local from v_world is `(v_world - t) @ R.T`, NOT `(v_world - t) @ R`. First version dropped the `.T` and produced a mirrored EE-local mesh. Fixed + added a reconstruction-error sanity check (max error must be < 1 µm); confirmed 0.0 reconstruction error in the live run. |
+| 2026-05-30 | Note: pose.json ee_quat magnitude ≠ 1 in the medical scene  | ⚠️ pose_from_medical_scene.py calls Gf.Matrix4d.ExtractRotationQuat() on a parent-scaled matrix (×100 because mesh-meters→scene-cm). The extracted quat has magnitude ~9.19 instead of 1.0. Not corrupted — just scaled. quat_wxyz_to_matrix() in register_phantom_multiview.py uses s=2/n which divides by the magnitude², so unnormalized quats produce the correct rotation matrix. Could be normalized in pose_from_medical_scene.py for cleanliness; not required for correctness. |
+| 2026-05-30 | Phase 5m: synthetic shaft extension (50 mm × 5 mm) added to the stamp | ✅ build_tool_stamp.py grows the stamp grid in EE-local −z and adds a cylinder beyond the real tip mesh.  Defaults SHAFT_LENGTH_MM=50, SHAFT_RADIUS_MM=5 → total tool 100 mm.  Stamp 627 KB (was 322).  On full-CT registration with the live scene: AP mask 2.43%, ry+45° 0.96%, lateral 0.21% — shaft silhouette varies dramatically per view (the visual cue the user wanted).  Convergence ALSO improved on full CT: 0.004 mm / 0.000° (vs 0.109 mm / 0.020° with cropped CT + tip-only).  On cropped CT (128 mm cube) the shaft mostly lands OUTSIDE the volume and is silently clipped (only 1.3k of 62k stamp voxels make it into the μ-volume) — the DRR looks identical to tip-only.  CT_FULL_VOLUME=1 needed to see the shaft.  Disable shaft entirely with SHAFT_LENGTH_MM=0. |
+| 2026-06-01 | Phase 5m: TOOL_MESH_PRIMS knob + multi-prim concatenation in extract_tool_mesh.py | ✅ Comma-separated USD paths; each mesh gets its own world→EE-local transform; faces re-offset and concatenated; per-mesh reconstruction sanity-check (< 1 µm). Default unchanged (tip only). Tested with [link_0, link_1]: combined 367k verts / 122k faces / 80×90×612 mm extent — extraction succeeds, but voxelizing the resulting mesh at 0.5 mm exhausts laptop RAM (OOM killed even with 16 GB swap). Mitigation: chunked trimesh.contains() via CONTAINS_CHUNK env (default 50,000) so peak memory stays bounded. For "full real tool" use STAMP_SPACING_MM=2.0 + small chunks. |
+| 2026-06-01 | Phase 5m: 3-way tool-scope comparison on full CT, live medical_scene | ✅ Identical blind 19.7 mm/5.8° start, 200 iters: none → 0.0003 mm / 47 s; tip+50mm shaft (current) → 0.0037 mm / 47 s; tip+200mm shaft (big) → 0.0039 mm / 45 s. Wall time identical; tool painting costs ~10× in final precision but stays well sub-mm. Big tool only adds visible silhouette on AP (mask 2.4% → 3.5%); lateral/oblique unchanged because extra shaft length extends outside even the full CT. paint_stamp_into_mu() silently drops out-of-volume stamp voxels. |
 
 ---
 
@@ -757,23 +825,114 @@ Commands (in order):
   `globals().pop(...)` not `globals().get(...)` — otherwise the value
   leaks into every subsequent injection.
 
+### Tool stamp pipeline (Phase 5m)
+
+- The stamp is built **once** per tool geometry, not per registration run.
+  Re-extract + rebuild only if the STAR tool USD changes (different
+  endo360 link, different scale, different EE prim).  Stale stamps are
+  forward-compatible: `paint_stamp_into_mu()` only reads `ee_pos`/
+  `ee_quat` from pose.json + the stamp metadata; the phantom/CT pose is
+  independent.
+- `trimesh.contains()` on the endo360 mesh is reported as *not* watertight
+  (winding-number fallback handles this).  ~37% of the bbox grid is
+  classified as interior — consistent with the bullet-shaped tip + a thin
+  shaft, but a few µm of edge thickness could be misclassified.  Acceptable
+  for μ-volume use; if a tighter binary mask is ever needed, fix the mesh
+  with `mesh.fill_holes()` before voxelizing.
+- The mesh is parented to `endo360_link_1`; the EE prim
+  `endo360_needle` is the TCP (tip) frame.  In EE-local coords the mesh
+  occupies z ∈ [−51.5, −1.0] mm (extends *behind* the EE), x,y ≈ ±6 mm.
+  If a future scene uses a different STAR EE prim, re-run
+  `extract_tool_mesh.py` and the stamp updates automatically.
+- **Choosing how much of the tool to bake in.** Three scopes have been
+  measured end-to-end (full CT, live medical_scene, blind 19.7 mm/5.8°
+  start, 3 views @ 0/45/90°, 200 iters):
+
+    | scope              | length  | final ‖t_err‖ | wall  | mask (AP/45°/lat) |
+    |--------------------|---------|---------------|-------|-------------------|
+    | none (no painting) | —       | 0.0003 mm     | 47 s  | —                 |
+    | tip + 50 mm shaft  | 100 mm  | 0.0037 mm     | 47 s  | 2.4% / 1.0% / 0.2% |
+    | tip + 200 mm shaft | 250 mm  | 0.0039 mm     | 45 s  | 3.5% / 1.0% / 0.2% |
+
+  Take-aways:
+    – Painting *any* tool costs ~10× in final precision (4 µm vs 0.3 µm),
+      but that's still well below clinical relevance.
+    – Wall time is unaffected (GPU renderer dominates; stamp resampling is cheap).
+    – Beyond ~100 mm the synthetic shaft mostly extends *outside even the
+      full CT volume* (it trails into air behind the patient), so the
+      lateral / oblique mask coverage barely changes. Only the AP view
+      sees the extra length because the shaft happens to lie roughly along
+      that beam direction.
+    – Disable entirely with `TOOL_IN_TARGET=0`; tune length with
+      `SHAFT_LENGTH_MM` at stamp-build time.
+
+- `build_tool_stamp.py` extends the stamp with a synthetic cylindrical
+  shaft (SHAFT_LENGTH_MM, SHAFT_RADIUS_MM; defaults 50 mm × 5 mm) so the
+  tool is ~100 mm total — this matters because the 50 mm tip alone
+  projects to a near-circular silhouette from every C-arm angle, while
+  the longer shaft gives clearly *different* silhouettes per view (a
+  long bar in AP, a small dot in lateral, etc).
+- **`TOOL_MESH_PRIMS` in extract_tool_mesh.py** (comma-separated USD prim
+  paths) lets you bake multiple meshes into the same EE-local stamp —
+  e.g. `TOOL_MESH_PRIMS=/World/Robot/endo360_link_0/visuals,/World/Robot/endo360_link_1/visuals`
+  for the real housing + tip. **Caveat**: the full real link_0 housing is
+  ~570 mm × 80 × 90 mm with 122k triangles. Voxelizing the full thing at
+  0.5 mm spacing exhausts laptop RAM during `trimesh.contains()` — the OOM
+  killer kicked in even with 16 GB swap. The synthetic-shaft path (the
+  default, configured via SHAFT_LENGTH_MM) avoids this entirely. If you
+  must use the real link_0 mesh, set `STAMP_SPACING_MM=2.0` or larger
+  and `CONTAINS_CHUNK=20000` to keep peak memory bounded.
+- `build_tool_stamp.py` runs `trimesh.contains()` in chunks of
+  `CONTAINS_CHUNK` points (default 50,000). Each chunk's intermediate
+  ray-intersection arrays are freed before the next, keeping peak memory
+  manageable on big meshes.
+  IMPORTANT: the shaft is only visible when registering against the
+  FULL CT (`CT_FULL_VOLUME=1`).  The 128 mm cropped CT clips most of it
+  (the shaft trails into the air space behind the patient, outside the
+  crop) — `paint_stamp_into_mu()` silently drops stamp voxels that land
+  outside the phantom μ-volume.  On the cropped CT the stamp behaves
+  identically to a tip-only stamp; on the full CT mask coverage varies
+  per view (~2.4% AP / ~1% oblique / ~0.2% lateral).
+  Convergence is unaffected by the addition (the shaft is far enough
+  from the spine that it sees mostly background or low-density soft
+  tissue in the loss).
+- The MASK coverage with the real tip is ~0.2% per view (vs ~4% for the
+  15 mm sphere).  This is by design: the actual tool is thinner, so
+  occlusion > 0.5 only triggers along the densest projected core of the
+  bullet.  Net effect on registration: MORE anatomy signal in the loss
+  (anatomy fraction 99.8% vs 96%), which empirically converges slightly
+  faster + tighter (0.11 mm vs 0.22 mm on the same scene).
+- `pose.json` `ee_quat` magnitude is ≠ 1 (≈ 9.19 on the cm-unit medical
+  scene because of scaled-matrix decomposition).  Not an issue —
+  `quat_wxyz_to_matrix()` divides by |q|² internally.  If you ever read
+  ee_quat in NEW code, either normalize first or use the same `s=2/n`
+  trick.
+- Stamp resampling is `scipy.ndimage.affine_transform` with `order=1`
+  (trilinear) + `prefilter=False`.  Higher order overshoots μ values and
+  can drive transmittance negative; trilinear with the binary stamp
+  produces clean smoothed edges that read correctly through the X-ray
+  log integral.
+
 ### Simulation simplifications (honest about what's not real)
 
-Two known places where the simulation is more permissive than a clinical
-setting.  Both are deferred fixes — listed in the Phase 5 checklist as
-unchecked items:
+Both previously known simplifications are now closed:
 
-1. **Tool not in the registration target image**.  `fluorosim_render.py`
-   (run by `run_fluorosim.sh`) paints the EE blob into the μ-volume → its
-   DRR shows the tool, matching a real fluoroscope.  But
-   `register_phantom_multiview.py` builds its target images from the
-   clean μ-volume — *no tool*.  Reason: μ=0.5 mm⁻¹ is ~28× cortical bone,
-   so an opaque blob occludes the spine and dominates the MSE loss.
-   Real-world fluoroscopy registration handles this by masking the tool
-   region or using a robust loss.  To make our simulation stricter, we'd
-   need to either paint the tool into the target AND add a mask/robust
-   loss, or accept that the tool is "known geometry" the registration
-   subtracts before matching.
+1. **Tool not in the registration target image** — ✅ **Fixed (Phase 5l).**
+   `register_phantom_multiview.py` now paints the EE blob (μ=0.3 mm⁻¹ ≈
+   stainless steel @ 60 keV, r=15 mm) into the TARGET μ-volume so the target
+   DRRs look like real fluoroscopy.  A tool-only volume is rendered per view
+   with normalize=False + invert=False (output = transmittance T = exp(−∫μ
+   dl)), thresholded as (1 − T) > TOOL_MASK_THRESH (default 0.5) to give a
+   binary tool mask covering ~4% of the image.  The registration loss is
+   `((rendered − target)² · (1 − mask)).sum() / mask_complement_count`, so
+   tool pixels contribute zero gradient — the optimiser matches anatomy
+   only.  Optimiser renderer keeps the CLEAN μ-volume; recovered DRRs are
+   re-rendered after optim with the tool at the RECOVERED EE voxel for
+   visualisation (matches GT to sub-voxel at convergence).  Verified on
+   live medical_scene + spine CT, blind 28 mm / 5.8° start, 3 views
+   (0,45,90), 200 iters: 0.217 mm / 0.130° world error.  Env vars:
+   TOOL_IN_TARGET (auto-on if pose.json has ee_pos), TOOL_MU_PER_MM,
+   TOOL_RADIUS_MM, TOOL_MASK_THRESH.
 
 2. **Optimizer init** — ✅ **Fixed (no longer a simplification).**
    `INIT_OFFSET_MM` is now an absolute offset from the C-arm isocenter
@@ -782,10 +941,8 @@ unchecked items:
    (default test case) results are identical to before; with GT≠0 the
    optimizer starts ||GT|| + ~20 mm from the answer and still converges.
 
-Only the first simplification (tool not in registration target) remains
-open. The registration ALGORITHM is identical to what would be used
-clinically; that simplification affects *input realism*, not *whether
-the math works*.
+The registration ALGORITHM is identical to what would be used clinically;
+both fixes affected *input realism*, not *whether the math works*.
 
 ---
 
@@ -841,7 +998,45 @@ INIT_ROT_DEG="5,0,3" N_ITERS=200 ~/isaac_projects/bridge/run_register_multiview.
 DICOM_PATH=~/medical_imaging/spine_mets_ct_seg/10250/04098/27242 \
   USE_POSE_JSON=1 N_ITERS=200 \
   ~/isaac_projects/bridge/run_register_multiview.sh
-# Plot multi-view results (host-side) — 4th panel shows rotation error:
+# Phase 5l: tool-in-target painting is auto-on when pose.json has ee_pos.
+# Tune via env (defaults shown):  TOOL_MU_PER_MM=0.3  TOOL_RADIUS_MM=15
+#   TOOL_MASK_THRESH=0.5 (occlusion cutoff: 0=any, 1=full beam absorbed)
+# Disable entirely with TOOL_IN_TARGET=0.
+TOOL_IN_TARGET=0 ~/isaac_projects/bridge/run_register_multiview.sh
+
+# Phase 5m: replace the sphere with the real endo360 tip mesh.
+# (1) Extract mesh from the live medical_scene into EE-local frame:
+python3 ~/isaac_projects/scenes/isaacsim_client.py < \
+    ~/isaac_projects/scenes/extract_tool_mesh.py
+# Bake both housing + tip (the "full" real tool, no synthetic shaft needed):
+#   TOOL_MESH_PRIMS=/World/Robot/endo360_link_0/visuals,/World/Robot/endo360_link_1/visuals \
+#     python3 ~/isaac_projects/scenes/isaacsim_client.py < \
+#         ~/isaac_projects/scenes/extract_tool_mesh.py
+# (2) Voxelize into a μ-stamp (host-side; needs `pip install trimesh rtree`):
+#     Defaults add a 50 mm × 5 mm synthetic shaft behind the real tip mesh →
+#     total tool ~100 mm.  Disable with SHAFT_LENGTH_MM=0.  The shaft is only
+#     visible when registering against the FULL CT (CT_FULL_VOLUME=1) — the
+#     128 mm cropped CT clips most of it.
+python3 ~/isaac_projects/bridge/build_tool_stamp.py
+# Tip-only stamp (no shaft):
+#   SHAFT_LENGTH_MM=0 python3 ~/isaac_projects/bridge/build_tool_stamp.py
+# Bigger synthetic tool (250 mm total) — more clinical look, ~10× more
+# anatomy masked on AP (3.5% vs 2.4%) but no change on lateral/oblique:
+#   SHAFT_LENGTH_MM=200 python3 ~/isaac_projects/bridge/build_tool_stamp.py
+# (3) Just re-run the registration — it auto-detects output/tool_stamp.npy
+#     and prints "Painting tool MESH STAMP into target volume".
+#     For the full tool silhouette use the full-volume CT cache:
+DICOM_PATH=~/medical_imaging/spine_mets_ct_seg/10250/04098/27242 \
+    CT_FULL_VOLUME=1 USE_POSE_JSON=1 N_ITERS=200 \
+    ~/isaac_projects/bridge/run_register_multiview.sh
+# Tip-only is fine on the cropped CT (the shaft would be outside anyway):
+DICOM_PATH=~/medical_imaging/spine_mets_ct_seg/10250/04098/27242 \
+    USE_POSE_JSON=1 N_ITERS=200 \
+    ~/isaac_projects/bridge/run_register_multiview.sh
+# Force the sphere fallback even when the stamp exists:
+#   mv output/tool_stamp.npy output/tool_stamp.npy.bak  (then re-run)
+# Plot multi-view results (host-side) — 4th panel shows rotation error;
+# images.png gets a 4th column with the red tool-mask overlay when painted:
 python3 ~/isaac_projects/bridge/plot_registration_multiview.py
 
 # Phase 5 deliverable: compute T_robot_to_anatomy from registration + pose.json

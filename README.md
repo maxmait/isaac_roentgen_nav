@@ -25,6 +25,7 @@ and phantom orientation from those shots. See the [Quick start](#quick-start--fu
 | Real spine CT — 6-DOF, 200 iters | **0.016 mm** | **0.020°** | 15.2 s |
 | Real spine CT — full 797×512×512 (3-DOF) | **0.076 mm** | — | 15.6 s |
 | Medical scene (STAR + spine on table) | **0.096 mm** | — | ~10 s |
+| Medical scene + real endo360 tool mesh in target | **0.004 mm** | **0.000°** | ~47 s |
 
 All on an RTX 4060 Laptop GPU (8 GB VRAM). The full CT volume fits with room to spare.
 
@@ -210,6 +211,28 @@ DICOM_PATH=~/medical_imaging/spine_mets_ct_seg/10250/04098/27242 \
   bridge/run_fluorosim.sh
 ```
 
+### Optional: build the real-tool stamp (one-time per tool geometry)
+
+The registration target DRRs auto-include the real endo360 tip + a synthetic
+shaft when `output/tool_stamp.npy` exists; without it the painter falls back
+to a sphere. Build the stamp once after the STAR robot is loaded in the
+scene:
+
+```bash
+# (1) Extract the endo360 tip mesh from the live scene into EE-local mm:
+python3 scenes/isaacsim_client.py < scenes/extract_tool_mesh.py
+
+# (2) Voxelize (host-side; needs `pip install trimesh rtree`):
+python3 bridge/build_tool_stamp.py
+# Defaults: 50 mm × 5 mm synthetic shaft → ~100 mm tool, 0.5 mm spacing.
+# Bigger tool (more clinical-looking) → 250 mm total:
+#   SHAFT_LENGTH_MM=200 python3 bridge/build_tool_stamp.py
+# No synthetic shaft (real tip mesh only):
+#   SHAFT_LENGTH_MM=0   python3 bridge/build_tool_stamp.py
+# Disable tool entirely at registration time:
+#   TOOL_IN_TARGET=0 bridge/run_register_multiview.sh
+```
+
 ### Workflow B — headless smoke test (Franka + synthetic phantom)
 
 The original Z-up world without an OR around it. Useful for regression
@@ -302,6 +325,43 @@ rotation and translation untangle, then converges sharply.*
 0.015 (AP) and 0.010 (lateral) is near the noise floor of the differentiable
 renderer.*
 
+### Real tool in the registration target — clinical fluoroscopy realism
+
+The target images now look like an actual intra-op X-ray with the endoscope
+inserted. The endo360 tip mesh is extracted from the live Isaac Sim scene into
+an EE-local voxel stamp (`scenes/extract_tool_mesh.py` →
+`bridge/build_tool_stamp.py`); at registration time the stamp is splatted into
+the μ-volume at the current EE pose, the steel tool occludes the underlying
+anatomy, and a per-view tool mask zeros out the tool's pixels in the loss so
+the optimizer matches anatomy only. After convergence the recovered DRR is
+re-rendered with the tool at the *recovered* EE voxel — at sub-voxel agreement
+with the target, the two look identical.
+
+![Registration target with the real endo360 tool](docs/images/registration_with_real_tool.png)
+
+*Three rows = three C-arm angles (AP / 45° / 90°). Columns = target with tool |
+recovered with tool | |diff| | tool mask used in the loss. The dark elongated
+opacity is the real endoscope tip + a synthetic shaft extension (the housing
+beyond ~100 mm is mostly outside even the full CT volume and gets silently
+clipped — see the project log). Mask coverage varies dramatically per view
+(3.5% AP / 1.0% oblique / 0.2% lateral) which is the visual cue a surgeon uses
+to recognize the tool from any C-arm angle.*
+
+Three tool-scope options, all converging to sub-µm from a 19.7 mm / 5.8° blind
+start on the live medical scene + full CT, 200 iters:
+
+| Tool scope | Final ‖t_err‖ | Final ‖r_err‖ | Wall time | AP mask |
+|---|---|---|---|---|
+| `none` (no tool painting) | **0.0003 mm** | 0.0000° | 47 s | — |
+| `current` (real tip + 50 mm synthetic shaft, 100 mm) | **0.0037 mm** | 0.0000° | 47 s | 2.4% |
+| `big` (real tip + 200 mm synthetic shaft, 250 mm) | **0.0039 mm** | 0.0000° | 45 s | 3.5% |
+
+Tool-driven DRR↔robot pose refinement is the natural follow-on: a tool-only
+differentiable render against the same μ-volume already exists (it's how the
+mask is built), so a gradient against the EE pose itself would pull the
+robot's hand to match the X-ray silhouette — closing the loop between
+fluoroscopic anatomy localization and robot-side calibration.
+
 ### Blind initialization and the need for a third view
 
 The optimizer is initialized **without any knowledge of the ground-truth
@@ -341,26 +401,23 @@ T_robot_in_anatomy.t  (mm)
 Clinical: Tool tip is INSIDE the bone core (normalized distance 0.77).
 ```
 
-### Simulation simplifications (honest about what's not real)
+### Simulation simplifications — both previously known gaps are now closed
 
-One remaining place where the simulation is more permissive than a clinical
-setting. It does not change the registration algorithm — only the input
-realism:
+The two places where the simulation used to be more permissive than a clinical
+setting have both been addressed without changing the registration algorithm
+itself; only the input realism changed:
 
-1. **The registration's target DRR does not include the robot tool.**
-   The demo DRR (`bridge/run_fluorosim.sh`, the image at the top of this
-   README) paints the EE blob into the μ-volume so the tool appears as a
-   dark opacity. The registration target images (`run_register_multiview.sh`)
-   are rendered from the clean μ-volume, no tool. Reason: the tool's μ is
-   ~28× cortical bone, so an opaque blob occludes the spine and dominates
-   the MSE loss. Real-world fluoroscopy registration handles this with
-   masking or a robust loss.
-
-*Previously a second simplification — the optimizer being initialized at
-`gt_translation_mm + offset` — was removed: initialization is now blind (from
-the C-arm isocenter only, independent of ground truth). See
-[Blind initialization](#blind-initialization-and-the-need-for-a-third-view)
-above.*
+1. **Tool in the registration target image** — ✅ *fixed (Phase 5l + 5m)*.
+   The target DRRs now show the real endo360 tip mesh (extracted from the live
+   STAR robot) plus a synthetic shaft, so they look like fluoroscopy with the
+   tool inserted. A per-view tool mask, derived from a tool-only differentiable
+   render of the same μ-volume, zeros the tool's pixels out of the loss so the
+   optimizer only matches anatomy. See [Real tool in the registration target](#real-tool-in-the-registration-target--clinical-fluoroscopy-realism)
+   above for the images and numbers.
+2. **Optimizer initialization** — ✅ *fixed*. The optimizer starts from the
+   C-arm isocenter plus a fixed planning offset; ground truth is used only for
+   scoring, never construction. See [Blind initialization](#blind-initialization-and-the-need-for-a-third-view)
+   above.
 
 ---
 
@@ -380,6 +437,7 @@ isaac_roentgen_nav/
 │   ├── capture_two_shots.py           # TCP-injected: timed two-shot capture (GUI)
 │   ├── verify_pose.py                 # TCP-injected: EE pose vs pose.json
 │   ├── verify_phantom.py              # TCP-injected: phantom prim world transform
+│   ├── extract_tool_mesh.py           # TCP-injected: endo360 mesh → EE-local mm
 │   ├── isaacsim_client.py             # TCP client for VSCode extension socket
 │   ├── image_publisher.py             # TCP-injected: ZMQ JPEG viewport stream
 │   └── take_snapshot.py               # ZMQ subscriber: save one frame
@@ -395,6 +453,7 @@ isaac_roentgen_nav/
 │   ├── run_register_multiview.sh      # wrapper for multi-view
 │   ├── plot_registration_multiview.py # host: 4-panel convergence + image grid
 │   ├── compute_robot_to_anatomy.py    # host: registration → T_R^A, T_R^C, T_A^C
+│   ├── build_tool_stamp.py            # host: voxelize EE-local mesh → tool_stamp.npy
 │   ├── ct_loader.py                   # DICOM CT → PreprocessedVolume (cropped or full)
 │   └── run_load_ct.sh                 # one-time CT cache builder
 ├── docs/images/                       # committed reference images for this README
@@ -445,12 +504,32 @@ isaac_roentgen_nav/
   offset only. Validated on a live scene with a +30 mm off-isocenter C-arm.
   Exposed (and fixed, via a third oblique view) the two-view tx↔ry coupling:
   3 views → **0.003 mm / 0.000°** from a 28 mm blind start
+- **Phase 5l — Tool in the registration target image.** Paints an
+  EE-positioned tool occluder (μ ≈ 0.3 mm⁻¹, ≈ stainless steel @ 60 keV) into
+  the target μ-volume so the rendered fluoroscopy looks clinical. A tool-only
+  differentiable render of the same volume gives a per-view binary mask
+  (`occlusion > 0.5`); the loss is `((rendered − target)² · (1 − mask))`
+  averaged over anatomy pixels only — the optimizer matches anatomy in spite
+  of the visible tool, just like a real clinical workflow with tool
+  segmentation
+- **Phase 5m — Real endo360 tool mesh in the DRR.** Three-stage pipeline
+  splits across the environments that have what's needed:
+  `scenes/extract_tool_mesh.py` (TCP-injected into Isaac Sim) writes the
+  endo360 tip mesh into EE-local mm; `bridge/build_tool_stamp.py` (host-side
+  with `trimesh`) voxelizes it into a small μ-stamp with an optional
+  synthetic shaft extension; `paint_stamp_into_mu()` in the registration
+  script splats the stamp into the phantom μ-volume via
+  `scipy.ndimage.affine_transform`. End-to-end on the live medical scene +
+  full CT: **0.004 mm / 0.000°** from a blind 19.7 mm / 5.8° start
 
 **Next:**
 
-- **Tool in registration target image** — see "Simulation simplifications"
-  above. Paint the EE blob into the target DRR and add a tool mask / robust
-  loss so the registration matches a clinical setting more strictly.
+- **Tool-driven DRR ↔ robot pose refinement** — the tool-only render +
+  per-view mask machinery from Phase 5l already gives the tool's silhouette
+  as a differentiable image. A gradient on `ee_pos` / `ee_quat` against the
+  observed tool silhouette in the target X-ray would *recover* the robot's
+  hand pose from fluoroscopy alone — refining FK with a feedback term and
+  closing the loop between fluoroscopic anatomy and robot-side calibration
 - **Trajectory planning** — consume T_R^A to drive the robot toward a
   surgical target while keeping the tool tip inside a safety region
 
