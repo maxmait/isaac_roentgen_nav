@@ -94,6 +94,13 @@ def _env_views_deg(default: tuple[float, ...]) -> tuple[float, ...]:
     return tuple(float(v) for v in raw.split(","))
 
 
+def _env_floats(name: str, default: tuple[float, ...]) -> tuple[float, ...]:
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    return tuple(float(v) for v in raw.split(","))
+
+
 # Default to 3 views (one oblique).  Two orthogonal views (0,90) leave the
 # in-plane translation↔rotation (tx↔ry) ambiguity unbroken in 6-DOF, so a
 # truly blind start can settle in a ~2mm/6° local minimum.  The oblique 45°
@@ -124,6 +131,39 @@ ROT_GRAD_CLIP   = _envf("ROT_GRAD_CLIP", 0.1)
 N_ITERS         = int(_envf("N_ITERS",   100))
 LOG_EVERY       = int(_envf("LOG_EVERY",   5))
 USE_POSE_JSON   = bool(int(os.environ.get("USE_POSE_JSON", "1")))
+
+# ─── Realistic image degradation (Step 1: break the "inverse crime") ──────────
+# A real fluoroscope records quantum (Poisson) photon noise + detector blur
+# (finite focal spot / pixel MTF) + a slowly-varying scatter pedestal.  We
+# perturb ONLY the TARGET images (what the "camera" sees); the optimiser keeps
+# its clean renderer, so the target is no longer exactly reproducible by the
+# forward model.  The registration then solves a realistic, ill-posed problem
+# instead of a self-consistent one (where target and optimiser share the same
+# renderer → unrealistically µm-level "accuracy").
+#
+# This is a PHENOMENOLOGICAL degradation applied in the optimiser's normalised
+# [0,1] display space (where the MSE loss lives), NOT a full photon Monte-Carlo
+# — enough to break the inverse crime and stress-test capture range / accuracy
+# under noise.  Off by default so the clean-case results stay reproducible.
+DRR_NOISE         = bool(int(os.environ.get("DRR_NOISE", "0")))
+DRR_BLUR_SIGMA_PX = _envf("DRR_BLUR_SIGMA_PX", 0.7)    # detector PSF (Gaussian σ, px)
+DRR_PHOTON_COUNT  = _envf("DRR_PHOTON_COUNT", 1.0e4)   # photons/px; lower = noisier
+DRR_SCATTER_FRAC  = _envf("DRR_SCATTER_FRAC", 0.0)     # low-freq additive scatter
+DRR_NOISE_SEED    = int(_envf("DRR_NOISE_SEED", -1))   # >=0 → reproducible target
+
+# ─── Capture-range / basin-of-attraction study (Step 2) ──────────────────────
+# When CAPTURE_RANGE=1 the script does NOT do a single registration; instead it
+# sweeps controlled initial offsets from the (known) GT pose and records, per
+# offset radius, whether the optimiser converges.  This deliberately USES GT to
+# place inits at known distances — it measures the optimiser's basin of
+# attraction, not a deployment scenario.  Output: output/capture_range.json.
+CAPTURE_RANGE     = bool(int(os.environ.get("CAPTURE_RANGE", "0")))
+CR_TRANS_RADII_MM = _env_floats("CR_TRANS_RADII_MM", (5., 10., 20., 30., 40., 60.))
+CR_N_SAMPLES      = int(_envf("CR_N_SAMPLES", 8))      # random directions per radius
+CR_ROT_OFFSET_DEG = _envf("CR_ROT_OFFSET_DEG", 5.0)   # rot perturbation per sample
+CR_SUCCESS_MM     = _envf("CR_SUCCESS_MM", 1.0)        # converged if ‖t_err‖ < this
+CR_SUCCESS_DEG    = _envf("CR_SUCCESS_DEG", 1.0)       # and geodesic rot err < this
+CR_SEED           = int(_envf("CR_SEED", 0))
 
 
 # ─── ZXY Euler helpers (differentiable) ──────────────────────────────────────
@@ -471,6 +511,242 @@ def load_volume() -> PreprocessedVolume:
     return load_or_build_synthetic_volume()
 
 
+def degrade_target_drrs(targets_np: list[np.ndarray]) -> list[np.ndarray]:
+    """Apply phenomenological fluoroscopy degradation to target images.
+
+    Operates in the optimiser's normalised [0,1] image space (bone bright after
+    invert).  Pipeline per view: detector blur (Gaussian PSF) → quantum
+    (Poisson) photon noise → optional low-frequency scatter pedestal → clip.
+
+    The Poisson model treats the [0,1] signal as a normalised photon count
+    N = photon_count · signal, so the per-pixel std ≈ sqrt(signal/photon_count)
+    is signal-dependent — brighter (more-attenuating) pixels are noisier, as in
+    a quantum-limited detector.  Returns NEW arrays; inputs untouched.
+    """
+    from scipy.ndimage import gaussian_filter
+
+    seed = DRR_NOISE_SEED if DRR_NOISE_SEED >= 0 else None
+    rng = np.random.default_rng(seed)
+    out: list[np.ndarray] = []
+    for img in targets_np:
+        x = img.astype(np.float32)
+        if DRR_BLUR_SIGMA_PX > 0:
+            x = gaussian_filter(x, sigma=DRR_BLUR_SIGMA_PX)
+        if DRR_PHOTON_COUNT > 0:
+            lam = np.clip(x, 0.0, None) * DRR_PHOTON_COUNT
+            x = rng.poisson(lam).astype(np.float32) / DRR_PHOTON_COUNT
+        if DRR_SCATTER_FRAC > 0:
+            ped = gaussian_filter(
+                rng.standard_normal(x.shape).astype(np.float32),
+                sigma=max(x.shape) / 8.0,
+            )
+            ped = ped / (np.abs(ped).max() + 1e-8) * DRR_SCATTER_FRAC
+            x = x + ped
+        out.append(np.clip(x, 0.0, 1.0).astype(np.float32))
+    return out
+
+
+def run_optimization(
+    drr_module,
+    translation: "torch.Tensor",
+    phantom_rot: "torch.Tensor",
+    optimizer,
+    rot_gantry_tensors: list,
+    targets: list,
+    weights: list,
+    weight_norms: list,
+    gt_translation_mm,
+    gt_phantom_rot_euler,
+    R_gt_np: np.ndarray,
+    n_iters: int,
+    view_names: list[str] | None = None,
+    log_every: int = 0,
+) -> tuple[list[dict], float]:
+    """Run the 6-DOF mask-weighted-MSE optimisation loop in place.
+
+    Mutates ``translation`` / ``phantom_rot`` (and the optimiser state).
+    Returns (trace, elapsed_seconds).  Factored out of main() so the
+    capture-range sweep — and, in future, a real-time tracking loop — can
+    reuse it with the SAME (already-loaded) drr_module / targets, paying the
+    volume + renderer setup cost only once.
+    """
+    trace: list[dict] = []
+    t_start = time.time()
+    for it in range(n_iters):
+        optimizer.zero_grad()
+        total_loss = torch.zeros((), dtype=torch.float32, device=translation.device)
+        per_view_loss: list[float] = []
+
+        R_ph = euler_zxy_to_matrix(phantom_rot)
+        t_world = translation
+
+        for rot_gantry, target, weight, w_norm in zip(
+            rot_gantry_tensors, targets, weights, weight_norms
+        ):
+            R_eff = R_ph.T @ euler_zxy_to_matrix(rot_gantry)
+            euler_eff = matrix_to_euler_zxy(R_eff)
+            t_eff = R_ph.T @ t_world
+            rendered = drr_module(euler_eff, t_eff)
+            loss_v = (((rendered - target) ** 2) * weight).sum() / w_norm
+            total_loss = total_loss + loss_v
+            per_view_loss.append(float(loss_v.item()))
+
+        total_loss.backward()
+        # fluorosim Slang autodiff sign-flip + NaN guard (see CLAUDE.md).
+        for p in [translation, phantom_rot]:
+            if p.grad is None:
+                continue
+            if torch.isnan(p.grad).any():
+                p.grad.zero_()
+            else:
+                p.grad.neg_()
+        if phantom_rot.grad is not None and phantom_rot.grad.abs().max() > 0:
+            torch.nn.utils.clip_grad_norm_([phantom_rot], max_norm=ROT_GRAD_CLIP)
+        optimizer.step()
+
+        t_np = translation.detach().cpu().numpy()
+        pr_np = phantom_rot.detach().cpu().numpy()
+        trans_err = t_np - np.asarray(gt_translation_mm)
+        rot_err_np = pr_np - np.asarray(gt_phantom_rot_euler, dtype=np.float32)
+        with torch.no_grad():
+            R_rec_np = euler_zxy_to_matrix(
+                torch.tensor(pr_np, dtype=torch.float32)
+            ).numpy().astype(np.float64)
+        rot_geo_deg = geodesic_angle_deg(R_gt_np, R_rec_np)
+
+        trace.append({
+            "iter": it,
+            "loss_total": float(total_loss.item()),
+            "loss_per_view": per_view_loss,
+            "translation_mm": t_np.tolist(),
+            "err_mm": trans_err.tolist(),
+            "err_norm_mm": float(np.linalg.norm(trans_err)),
+            "phantom_rot_euler_rad": pr_np.tolist(),
+            "rot_err_euler_deg": [math.degrees(v) for v in rot_err_np.tolist()],
+            "rot_err_geodesic_deg": rot_geo_deg,
+        })
+        if log_every and (it % log_every == 0 or it == n_iters - 1):
+            if view_names is not None:
+                pv = "  ".join(
+                    f"{view_names[i]}={per_view_loss[i]:.2e}"
+                    for i in range(len(view_names))
+                )
+            else:
+                pv = ""
+            print(f"  iter {it:3d}: total={total_loss.item():.6e}  {pv}  "
+                  f"||t_err||={trace[-1]['err_norm_mm']:.3f} mm  "
+                  f"||r_err||={rot_geo_deg:.3f}°")
+    return trace, time.time() - t_start
+
+
+def run_capture_range(
+    drr_module,
+    rot_gantry_tensors: list,
+    targets: list,
+    weights: list,
+    weight_norms: list,
+    gt_translation_mm,
+    gt_phantom_rot_euler,
+    R_gt_np: np.ndarray,
+    device,
+) -> dict:
+    """Sweep controlled init offsets from GT and record convergence per radius.
+
+    Returns a results dict (also serialised to output/capture_range.json by
+    the caller).  Uses run_optimization() so the renderer + targets are reused
+    across all samples — only the init tensors + optimiser are rebuilt.
+    """
+    rng = np.random.default_rng(CR_SEED)
+    gt_t = np.asarray(gt_translation_mm, dtype=np.float32)
+    gt_r = np.asarray(gt_phantom_rot_euler, dtype=np.float32)
+    samples: list[dict] = []
+
+    print(f"\n[CR] Capture-range sweep: radii (mm) = {list(CR_TRANS_RADII_MM)}, "
+          f"{CR_N_SAMPLES} samples/radius, rot offset = {CR_ROT_OFFSET_DEG}°, "
+          f"{N_ITERS} iters/sample")
+    print(f"[CR] Success := ‖t_err‖ < {CR_SUCCESS_MM} mm AND geodesic rot err "
+          f"< {CR_SUCCESS_DEG}°")
+
+    for radius in CR_TRANS_RADII_MM:
+        for s in range(CR_N_SAMPLES):
+            # Random unit direction (translation) and random small rotation axis.
+            u = rng.standard_normal(3).astype(np.float32)
+            u /= (np.linalg.norm(u) + 1e-8)
+            init_trans = gt_t + radius * u
+            rax = rng.standard_normal(3).astype(np.float32)
+            rax /= (np.linalg.norm(rax) + 1e-8)
+            init_rot = gt_r + np.radians(CR_ROT_OFFSET_DEG) * rax
+
+            translation = torch.tensor(init_trans, dtype=torch.float32,
+                                       device=device, requires_grad=True)
+            phantom_rot = torch.tensor(init_rot, dtype=torch.float32,
+                                       device=device, requires_grad=True)
+            optimizer = torch.optim.Adam([
+                {"params": [translation], "lr": LR_MM},
+                {"params": [phantom_rot], "lr": LR_ROT_RAD},
+            ])
+            trace, _ = run_optimization(
+                drr_module, translation, phantom_rot, optimizer,
+                rot_gantry_tensors, targets, weights, weight_norms,
+                gt_translation_mm, gt_phantom_rot_euler, R_gt_np,
+                N_ITERS, view_names=None, log_every=0,
+            )
+            final = trace[-1]
+            init_err = float(np.linalg.norm(init_trans - gt_t))
+            success = (final["err_norm_mm"] < CR_SUCCESS_MM
+                       and final["rot_err_geodesic_deg"] < CR_SUCCESS_DEG)
+            samples.append({
+                "radius_mm": float(radius),
+                "sample": s,
+                "init_err_norm_mm": init_err,
+                "init_rot_err_deg": float(CR_ROT_OFFSET_DEG),
+                "final_err_norm_mm": final["err_norm_mm"],
+                "final_rot_geodesic_deg": final["rot_err_geodesic_deg"],
+                "final_loss": final["loss_total"],
+                "success": bool(success),
+            })
+            print(f"  r={radius:5.1f}mm  s={s}  init‖t‖={init_err:5.1f}mm  "
+                  f"-> final ‖t‖={final['err_norm_mm']:7.3f}mm  "
+                  f"rot={final['rot_err_geodesic_deg']:6.3f}°  "
+                  f"{'OK ' if success else 'FAIL'}")
+
+    per_radius = []
+    for radius in CR_TRANS_RADII_MM:
+        grp = [s for s in samples if s["radius_mm"] == float(radius)]
+        n_ok = sum(s["success"] for s in grp)
+        fin = np.array([s["final_err_norm_mm"] for s in grp])
+        per_radius.append({
+            "radius_mm": float(radius),
+            "n": len(grp),
+            "n_success": int(n_ok),
+            "success_rate": float(n_ok / max(1, len(grp))),
+            "median_final_mm": float(np.median(fin)),
+            "max_final_mm": float(fin.max()),
+        })
+        print(f"[CR] r={radius:5.1f}mm: success {n_ok}/{len(grp)} "
+              f"({100*n_ok/max(1,len(grp)):.0f}%)  "
+              f"median final ‖t‖={np.median(fin):.3f}mm")
+
+    return {
+        "config": {
+            "trans_radii_mm": list(CR_TRANS_RADII_MM),
+            "n_samples": CR_N_SAMPLES,
+            "rot_offset_deg": CR_ROT_OFFSET_DEG,
+            "n_iters": N_ITERS,
+            "success_mm": CR_SUCCESS_MM,
+            "success_deg": CR_SUCCESS_DEG,
+            "seed": CR_SEED,
+            "views_deg_y": list(VIEWS_DEG_Y),
+            "drr_noise": DRR_NOISE,
+            "lr_mm": LR_MM,
+            "lr_rot_rad": LR_ROT_RAD,
+        },
+        "gt_translation_mm": [float(v) for v in gt_translation_mm],
+        "per_radius": per_radius,
+        "samples": samples,
+    }
+
+
 # ─── main ─────────────────────────────────────────────────────────────────────
 
 def main() -> int:
@@ -635,6 +911,19 @@ def main() -> int:
         print(f"  [{view['name']:>8}] ry={view['angle_deg']:+.1f}°  "
               f"range=[{img.min():.4f}, {img.max():.4f}]  std={img.std():.4f}")
 
+    # --- Realistic degradation of the TARGET images (Step 1) -----------------
+    # Breaks the inverse crime: the optimiser's renderer stays clean, so the
+    # noisy/blurred target is no longer exactly reproducible by the forward
+    # model.  Off unless DRR_NOISE=1.
+    if DRR_NOISE:
+        print(f"\n[2a] Degrading target DRRs (blur σ={DRR_BLUR_SIGMA_PX}px, "
+              f"photons/px={DRR_PHOTON_COUNT:.0f}, scatter={DRR_SCATTER_FRAC}, "
+              f"seed={DRR_NOISE_SEED})")
+        clean_std = [float(t.std()) for t in targets_np]
+        targets_np = degrade_target_drrs(targets_np)
+        for view, cs, t in zip(views, clean_std, targets_np):
+            print(f"  [{view['name']:>8}] std {cs:.4f} -> {float(t.std()):.4f}")
+
     # --- Per-view tool masks (rendered from the tool-only μ-volume) ----------
     # Rendered with normalize=False + invert=False — the renderer's output
     # is then transmittance T = exp(−∫μ dl):
@@ -738,79 +1027,26 @@ def main() -> int:
             torch.tensor(gt_rot_np, dtype=torch.float32)
         ).numpy().astype(np.float64)
 
+    # --- Capture-range study (Step 2): sweep init offsets, then exit ---------
+    if CAPTURE_RANGE:
+        cr = run_capture_range(
+            drr_module, rot_gantry_tensors, targets, weights, weight_norms,
+            gt_translation_mm, gt_phantom_rot_euler, R_gt_np,
+            translation.device,
+        )
+        with open(OUT_DIR / "capture_range.json", "w") as f:
+            json.dump(cr, f, indent=2)
+        print(f"\n[CR] Wrote {OUT_DIR / 'capture_range.json'}")
+        return 0
+
     # --- Optimize ------------------------------------------------------------
     print("\n[4] Optimizing (summed MSE across views, 6-DOF)...")
-    trace = []
-    t_start = time.time()
-    for it in range(N_ITERS):
-        optimizer.zero_grad()
-        total_loss = torch.zeros((), dtype=torch.float32, device=translation.device)
-        per_view_loss: list[float] = []
-
-        R_ph = euler_zxy_to_matrix(phantom_rot)
-        t_world = translation  # world-frame displacement (mm)
-
-        for rot_gantry, target, weight, w_norm in zip(
-            rot_gantry_tensors, targets, weights, weight_norms
-        ):
-            R_eff    = R_ph.T @ euler_zxy_to_matrix(rot_gantry)
-            euler_eff = matrix_to_euler_zxy(R_eff)
-            t_eff    = R_ph.T @ t_world
-            rendered = drr_module(euler_eff, t_eff)
-            # Mask-weighted MSE over anatomy pixels only (tool footprint = 0).
-            loss_v   = (((rendered - target) ** 2) * weight).sum() / w_norm
-            total_loss = total_loss + loss_v
-            per_view_loss.append(float(loss_v.item()))
-
-        total_loss.backward()
-        # fluorosim Slang autodiff sign-flip + NaN guard.
-        # The translation backward is reliable (tested in 3-DOF).
-        # The rotation backward (new code path) may produce NaN in some
-        # configurations — zero it out to skip that update safely.
-        for p in [translation, phantom_rot]:
-            if p.grad is None:
-                continue
-            if torch.isnan(p.grad).any():
-                p.grad.zero_()
-            else:
-                p.grad.neg_()  # sign-flip correction for Slang autodiff
-        # Clip rotation gradient to prevent accumulation from near-zero
-        # gradient noise on symmetric phantoms (sphere).
-        if phantom_rot.grad is not None and phantom_rot.grad.abs().max() > 0:
-            torch.nn.utils.clip_grad_norm_([phantom_rot], max_norm=ROT_GRAD_CLIP)
-        optimizer.step()
-
-        t_np  = translation.detach().cpu().numpy()
-        pr_np = phantom_rot.detach().cpu().numpy()
-        trans_err  = t_np - np.asarray(gt_translation_mm)
-        rot_err_np = pr_np - np.asarray(gt_phantom_rot_euler, dtype=np.float32)
-        with torch.no_grad():
-            R_rec_np = euler_zxy_to_matrix(
-                torch.tensor(pr_np, dtype=torch.float32)
-            ).numpy().astype(np.float64)
-        rot_geo_deg = geodesic_angle_deg(R_gt_np, R_rec_np)
-
-        entry = {
-            "iter": it,
-            "loss_total": float(total_loss.item()),
-            "loss_per_view": per_view_loss,
-            "translation_mm":     t_np.tolist(),
-            "err_mm":             trans_err.tolist(),
-            "err_norm_mm":        float(np.linalg.norm(trans_err)),
-            "phantom_rot_euler_rad": pr_np.tolist(),
-            "rot_err_euler_deg":  [math.degrees(v) for v in rot_err_np.tolist()],
-            "rot_err_geodesic_deg": rot_geo_deg,
-        }
-        trace.append(entry)
-        if it % LOG_EVERY == 0 or it == N_ITERS - 1:
-            pv = "  ".join(
-                f"{view['name']}={per_view_loss[i]:.2e}"
-                for i, view in enumerate(views)
-            )
-            print(f"  iter {it:3d}: total={total_loss.item():.6e}  {pv}  "
-                  f"||t_err||={entry['err_norm_mm']:.3f} mm  "
-                  f"||r_err||={rot_geo_deg:.3f}°")
-    elapsed = time.time() - t_start
+    trace, elapsed = run_optimization(
+        drr_module, translation, phantom_rot, optimizer,
+        rot_gantry_tensors, targets, weights, weight_norms,
+        gt_translation_mm, gt_phantom_rot_euler, R_gt_np,
+        N_ITERS, view_names=[v["name"] for v in views], log_every=LOG_EVERY,
+    )
 
     # --- Save artifacts ------------------------------------------------------
     print("\n[5] Saving outputs...")

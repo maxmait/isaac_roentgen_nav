@@ -24,6 +24,23 @@
 #   TOOL_RADIUS_MM  tool sphere radius                            (default 15)
 #   TOOL_MASK_THRESH occlusion threshold for tool mask            (default 0.1)
 #
+#   --- Step 1: realistic target degradation (break the inverse crime) ---
+#   DRR_NOISE         1 = add noise/blur to TARGET DRRs only       (default 0)
+#   DRR_BLUR_SIGMA_PX detector PSF Gaussian sigma in px            (default 0.7)
+#   DRR_PHOTON_COUNT  photons/px for Poisson noise; lower=noisier  (default 1e4)
+#   DRR_SCATTER_FRAC  low-frequency additive scatter fraction      (default 0)
+#   DRR_NOISE_SEED    >=0 → reproducible target realisation        (default -1)
+#
+#   --- Step 2: capture-range / basin-of-attraction study ---
+#   CAPTURE_RANGE     1 = sweep init offsets instead of one run    (default 0)
+#                     writes output/capture_range.json
+#   CR_TRANS_RADII_MM comma list of init offset radii (mm)  (default "5,10,20,30,40,60")
+#   CR_N_SAMPLES      random directions per radius                 (default 8)
+#   CR_ROT_OFFSET_DEG rotation perturbation per sample             (default 5)
+#   CR_SUCCESS_MM     converged if final ‖t_err‖ < this            (default 1.0)
+#   CR_SUCCESS_DEG    and geodesic rot err < this                  (default 1.0)
+#   CR_SEED           RNG seed for reproducible sampling           (default 0)
+#
 # Usage:
 #   ~/isaac_projects/bridge/run_register_multiview.sh
 #   VIEWS_DEG_Y="0,45,90" N_ITERS=150 ~/isaac_projects/bridge/run_register_multiview.sh
@@ -43,7 +60,7 @@ fi
 mkdir -p "${HOST_IO_DIR}/registration_multiview"
 
 DOCKER_ENV_ARGS=()
-for v in VIEWS_DEG_Y INIT_OFFSET_MM INIT_ROT_DEG LR_MM LR_ROT_RAD ROT_GRAD_CLIP N_ITERS LOG_EVERY USE_POSE_JSON USE_CARM_ROTATION CT_FULL_VOLUME CT_CROP_CENTER_ZYX TOOL_IN_TARGET TOOL_RADIUS_MM TOOL_MU_PER_MM TOOL_MASK_THRESH; do
+for v in VIEWS_DEG_Y INIT_OFFSET_MM INIT_ROT_DEG LR_MM LR_ROT_RAD ROT_GRAD_CLIP N_ITERS LOG_EVERY USE_POSE_JSON USE_CARM_ROTATION CT_FULL_VOLUME CT_CROP_CENTER_ZYX TOOL_IN_TARGET TOOL_RADIUS_MM TOOL_MU_PER_MM TOOL_MASK_THRESH DRR_NOISE DRR_BLUR_SIGMA_PX DRR_PHOTON_COUNT DRR_SCATTER_FRAC DRR_NOISE_SEED CAPTURE_RANGE CR_TRANS_RADII_MM CR_N_SAMPLES CR_ROT_OFFSET_DEG CR_SUCCESS_MM CR_SUCCESS_DEG CR_SEED; do
     if [[ -n "${!v:-}" ]]; then
         DOCKER_ENV_ARGS+=("-e" "${v}=${!v}")
     fi

@@ -122,7 +122,7 @@ Full input audit:
 | C-arm gantry angle per shot | Captured from USD prim | Gantry encoders | ✓ |
 | CT μ-volume | Real DICOM spine CT or synthetic cache | Pre-op CT, segmented HU→μ | ✓ (mechanism identical) |
 | Target X-ray | Rendered by fluorosim | Actual X-ray photons | ✓ (same Beer–Lambert physics) |
-| Optimizer initial guess | `gt + INIT_OFFSET_MM` | Planning prior or "anatomy at isocenter" | ⚠ uses GT as basis for testing; easily replaced with a fixed prior |
+| Optimizer initial guess | C-arm isocenter + `INIT_OFFSET_MM` | Planning prior or "anatomy at isocenter" | ✓ blind — never derived from GT (GT used only to score) |
 | Ground-truth phantom pose (for scoring) | `pose.json` | Sim-only — NOT used by the optimizer | Validation reference only |
 
 ---
@@ -169,6 +169,45 @@ pip install -e .
 ---
 
 ## Quick start — full end-to-end
+
+### Workflow 0 — one button (recommended)
+
+Pose the STAR robot's needle near the spine in the open `medical_scene.usd`
+GUI, then run a single command. `bridge/register_oneshot.py` chains all three
+stages — it sweeps the C-arm to each view angle in the live scene (capture),
+runs the 6-DOF multi-view registration in Docker (register), and composes the
+transforms (compose) — then prints `T_A^C / T_R^A / T_R^C`, the registration
+error, and the clinical check.
+
+```bash
+conda deactivate
+cd ~/isaac_projects
+
+python3 bridge/register_oneshot.py                 # real spine CT, 3 views (0/45/90)
+python3 bridge/register_oneshot.py --full-ct       # full CT volume (best accuracy)
+python3 bridge/register_oneshot.py --noise         # realistic target DRR noise
+python3 bridge/register_oneshot.py --no-capture    # reuse existing pose.json (skip the GUI)
+python3 bridge/register_oneshot.py --no-plot       # skip the deliverable figure
+python3 bridge/register_oneshot.py --synthetic --views 0,60,120 --n-iters 250
+```
+
+Every run writes `output/robot_to_anatomy.json` and the deliverable figure
+`output/robot_to_anatomy_layout.png` (unless `--no-plot`):
+
+![Deliverable layout — tool in the recovered anatomy frame](docs/images/robot_to_anatomy_layout.png)
+
+*Three orthogonal CT planes (axial / coronal / sagittal) through the anatomy
+isocenter, with the **estimated** tool drawn as an oriented needle (green tip +
+cyan shaft) recovered purely from the X-ray registration. The **ground-truth**
+tool (red open circle + dashed shaft, from Isaac Sim) is overlaid for
+validation — at this accuracy the two coincide (`Δest` in the legend). The text
+panel reports the three recovered transforms, the per-transform error vs ground
+truth, and the data-driven inside-bone / soft-tissue check. In a real procedure
+only the green estimate exists; the red overlay is a simulation-only accuracy
+reference.*
+
+The stages below (Workflows A / B) are the same pipeline run by hand — useful
+when you want to inspect or tweak an individual step.
 
 ### Workflow A — medical scene + real CT + GUI-driven C-arm (the demo)
 
@@ -452,7 +491,9 @@ isaac_roentgen_nav/
 │   ├── register_phantom_multiview.py  # multi-view 6-DOF registration (primary)
 │   ├── run_register_multiview.sh      # wrapper for multi-view
 │   ├── plot_registration_multiview.py # host: 4-panel convergence + image grid
-│   ├── compute_robot_to_anatomy.py    # host: registration → T_R^A, T_R^C, T_A^C
+│   ├── register_oneshot.py            # host: ONE-BUTTON capture → register → compose
+│   ├── compute_robot_to_anatomy.py    # host: registration → T_R^A, T_R^C, T_A^C + figure
+│   ├── plot_capture_range.py          # host: basin-of-attraction curve + scatter
 │   ├── build_tool_stamp.py            # host: voxelize EE-local mesh → tool_stamp.npy
 │   ├── ct_loader.py                   # DICOM CT → PreprocessedVolume (cropped or full)
 │   └── run_load_ct.sh                 # one-time CT cache builder
@@ -521,6 +562,16 @@ isaac_roentgen_nav/
   script splats the stamp into the phantom μ-volume via
   `scipy.ndimage.affine_transform`. End-to-end on the live medical scene +
   full CT: **0.004 mm / 0.000°** from a blind 19.7 mm / 5.8° start
+- **Phase 5n — Validation realism + capture range.** `DRR_NOISE=1` perturbs the
+  target DRRs (PSF blur + Poisson photon noise + scatter) so the optimizer can
+  no longer exactly reproduce them, breaking the "inverse crime" that made the
+  headline errors sub-µm. `CAPTURE_RANGE=1` sweeps controlled init offsets from
+  the known pose and records the basin of attraction (`plot_capture_range.py`)
+- **Phase 5o — One-button driver.** `bridge/register_oneshot.py` chains
+  capture → register → compose from a single command and prints all three
+  transforms; `compute_robot_to_anatomy.py` now emits a 4-panel **deliverable
+  figure** (axial/coronal/sagittal CT with the estimated tool needle + a
+  ground-truth overlay + transform/clinical text panel). `--no-plot` skips it
 
 **Next:**
 

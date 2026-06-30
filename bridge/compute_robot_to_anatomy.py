@@ -253,6 +253,14 @@ def clinical_summary(ee_in_anatomy_m: np.ndarray) -> dict:
 
 
 # ─── visualization ────────────────────────────────────────────────────────────
+def _wrap(text: str, width: int) -> list[str]:
+    """Wrap a line to ``width`` chars, preserving its leading indent."""
+    import textwrap
+    indent = text[: len(text) - len(text.lstrip())]
+    return textwrap.wrap(text, width=width, subsequent_indent=indent + "  ") \
+        or [text]
+
+
 def draw_ellipse(ax, semi_a_mm, semi_b_mm, edgecolor, label):
     """Add an ellipse at origin with the given semi-axes (mm) to the axes."""
     from matplotlib.patches import Ellipse
@@ -276,6 +284,7 @@ def _load_ct_slices_for_layout() -> dict | None:
             return {
                 "axial":    np.asarray(mu[z0, :, :]),  # XY plane, +Z out of page
                 "coronal":  np.asarray(mu[:, y0, :]),  # XZ plane, +Y into page
+                "sagittal": np.asarray(mu[:, :, x0]),  # YZ plane, +X out of page
                 "spacing":  spacing,
                 "shape":    mu.shape,
                 "cache":    str(cache),
@@ -284,9 +293,26 @@ def _load_ct_slices_for_layout() -> dict | None:
 
 
 def make_layout_plot(ee_anatomy_mm: np.ndarray,
+                     tool_seg_anatomy_mm: np.ndarray,
+                     ee_anatomy_gt_mm: np.ndarray,
+                     tool_seg_gt_anatomy_mm: np.ndarray,
                      phantom_err_mm: np.ndarray,
                      err_norm_mm: float,
+                     summary_lines: list[str],
                      show: bool) -> None:
+    """Deliverable figure: tool pose in the recovered anatomy frame.
+
+    Three orthogonal anatomy-frame panels (axial / coronal / sagittal) show
+    the recovered robot tool as an oriented needle over the CT (or the
+    synthetic ellipsoid), and a fourth text panel reports the recovered
+    transforms + registration error + the clinical inside/outside check.
+
+    tool_seg_anatomy_mm is a (2, 3) array: the tool shaft endpoints (tip and
+    rear) in anatomy-frame mm, so the needle's orientation is visible, not
+    just its tip position (ee_anatomy_mm).  ``*_gt_*`` are the same quantities
+    for the Isaac Sim ground-truth anatomy pose, drawn as a faint overlay so
+    the estimate-vs-truth agreement is visible (they coincide at sub-mm error).
+    """
     try:
         import matplotlib
         if not show:
@@ -296,7 +322,9 @@ def make_layout_plot(ee_anatomy_mm: np.ndarray,
         print("(matplotlib not available — skipping layout plot)")
         return
 
-    fig, (ax_xy, ax_xz) = plt.subplots(1, 2, figsize=(12, 5.5))
+    fig, axes = plt.subplots(2, 2, figsize=(13, 11))
+    ax_xy, ax_xz = axes[0, 0], axes[0, 1]
+    ax_yz, ax_txt = axes[1, 0], axes[1, 1]
 
     ct = _load_ct_slices_for_layout()
     if ct is not None:
@@ -318,59 +346,95 @@ def make_layout_plot(ee_anatomy_mm: np.ndarray,
             ax.set_title(title)
             ax.grid(True, alpha=0.2, color="white")
 
-        # Left: axial slice (XY plane)
         _show(ax_xy, ct["axial"],
               extent=[-half_x, half_x, -half_y, half_y],
               xlabel="X (mm) — anatomy frame",
               ylabel="Y (mm) — anatomy frame",
-              title=f"Axial CT slice  z=0  (XY plane)")
-        # Right: coronal slice (XZ plane)
+              title="Axial CT slice  z=0  (XY plane)")
         _show(ax_xz, ct["coronal"],
               extent=[-half_x, half_x, -half_z, half_z],
               xlabel="X (mm) — anatomy frame",
               ylabel="Z (mm) — anatomy frame",
-              title=f"Coronal CT slice  y=0  (XZ plane)")
+              title="Coronal CT slice  y=0  (XZ plane)")
+        _show(ax_yz, ct["sagittal"],
+              extent=[-half_y, half_y, -half_z, half_z],
+              xlabel="Y (mm) — anatomy frame",
+              ylabel="Z (mm) — anatomy frame",
+              title="Sagittal CT slice  x=0  (YZ plane)")
         plot_method = f"CT μ-slices ({Path(ct['cache']).name})"
     else:
         # Ellipsoid fallback for the synthetic phantom
         soft_x, soft_y, soft_z = (v * 1000.0 for v in SOFT_TISSUE_SEMIAXES_M)
         bone_x, bone_y, bone_z = (v * 1000.0 for v in BONE_CORE_SEMIAXES_M)
-        draw_ellipse(ax_xy, soft_x, soft_y, "#d68a82", "soft tissue (30×30 mm)")
-        draw_ellipse(ax_xy, bone_x, bone_y, "#888888", "bone core (20×20 mm)")
-        draw_ellipse(ax_xz, soft_x, soft_z, "#d68a82", "soft tissue (30×60 mm)")
-        draw_ellipse(ax_xz, bone_x, bone_z, "#888888", "bone core (20×40 mm)")
+        draw_ellipse(ax_xy, soft_x, soft_y, "#d68a82", "soft tissue")
+        draw_ellipse(ax_xy, bone_x, bone_y, "#888888", "bone core")
+        draw_ellipse(ax_xz, soft_x, soft_z, "#d68a82", "soft tissue")
+        draw_ellipse(ax_xz, bone_x, bone_z, "#888888", "bone core")
+        draw_ellipse(ax_yz, soft_y, soft_z, "#d68a82", "soft tissue")
+        draw_ellipse(ax_yz, bone_y, bone_z, "#888888", "bone core")
         ax_xy.set_xlim(-45, 45); ax_xy.set_ylim(-45, 45); ax_xy.set_aspect("equal")
         ax_xz.set_xlim(-45, 45); ax_xz.set_ylim(-75, 75); ax_xz.set_aspect("equal")
-        ax_xy.set_xlabel("X (mm) — anatomy frame")
-        ax_xy.set_ylabel("Y (mm) — anatomy frame")
-        ax_xy.set_title("Top-down view  (XY plane, +Z out of page)")
-        ax_xz.set_xlabel("X (mm) — anatomy frame")
-        ax_xz.set_ylabel("Z (mm) — anatomy frame")
-        ax_xz.set_title("Side view  (XZ plane, +Y into page)")
-        ax_xy.grid(True, alpha=0.3)
-        ax_xz.grid(True, alpha=0.3)
+        ax_yz.set_xlim(-45, 45); ax_yz.set_ylim(-75, 75); ax_yz.set_aspect("equal")
+        ax_xy.set_xlabel("X (mm) — anatomy frame"); ax_xy.set_ylabel("Y (mm)")
+        ax_xy.set_title("Axial  (XY plane, +Z out of page)")
+        ax_xz.set_xlabel("X (mm) — anatomy frame"); ax_xz.set_ylabel("Z (mm)")
+        ax_xz.set_title("Coronal  (XZ plane, +Y into page)")
+        ax_yz.set_xlabel("Y (mm) — anatomy frame"); ax_yz.set_ylabel("Z (mm)")
+        ax_yz.set_title("Sagittal  (YZ plane, +X out of page)")
+        for ax in (ax_xy, ax_xz, ax_yz):
+            ax.grid(True, alpha=0.3)
         plot_method = "synthetic ellipsoid"
 
-    # Overlay markers on both views — same for CT or ellipsoid
-    for ax, (xi, yi, xlbl, ylbl) in [
-        (ax_xy, (0, 1, "X", "Y")),
-        (ax_xz, (0, 2, "X", "Z")),
-    ]:
-        ax.plot(ee_anatomy_mm[xi], ee_anatomy_mm[yi], "o",
+    # Overlay the tool on each orthogonal plane.  (xi, yi) selects which
+    # anatomy axes map to each panel's horizontal / vertical axis.  The GT
+    # tool is drawn first (underneath) as a faint dashed needle so the
+    # estimate sits on top of it where the two agree.
+    tip_mm     = tool_seg_anatomy_mm[0]
+    rear_mm    = tool_seg_anatomy_mm[1]
+    tip_gt_mm  = tool_seg_gt_anatomy_mm[0]
+    rear_gt_mm = tool_seg_gt_anatomy_mm[1]
+    tip_err_mm = float(np.linalg.norm(ee_anatomy_mm - ee_anatomy_gt_mm))
+    for ax, (xi, yi) in [(ax_xy, (0, 1)), (ax_xz, (0, 2)), (ax_yz, (1, 2))]:
+        # Ground-truth tool (faint, underneath)
+        ax.plot([rear_gt_mm[xi], tip_gt_mm[xi]], [rear_gt_mm[yi], tip_gt_mm[yi]],
+                "--", color="#ff3d3d", lw=3.5, alpha=0.55, solid_capstyle="round",
+                label="tool shaft (ground truth)")
+        ax.plot(tip_gt_mm[xi], tip_gt_mm[yi], "o", color="none",
+                markeredgecolor="#ff3d3d", mew=2.0, ms=15, alpha=0.85,
+                label=f"tool tip (GT)  Δest={tip_err_mm:.3f} mm")
+        # Estimated tool (recovered, on top)
+        ax.plot([rear_mm[xi], tip_mm[xi]], [rear_mm[yi], tip_mm[yi]],
+                "-", color="#00e5ff", lw=2.5, solid_capstyle="round",
+                label="tool shaft (estimated)")
+        ax.plot(tip_mm[xi], tip_mm[yi], "o",
                 color="#2ca02c", ms=10, markeredgecolor="white", mew=1.2,
-                label=f"EE  ({ee_anatomy_mm[xi]:.2f}, {ee_anatomy_mm[yi]:.2f}) mm")
+                label=f"tool tip (est.) ({ee_anatomy_mm[xi]:.1f}, {ee_anatomy_mm[yi]:.1f}) mm")
         ax.plot(0, 0, "+", color="#ffeb3b", ms=14, mew=2.5,
-                label="GT phantom origin")
+                label="anatomy origin (GT)")
         ax.plot(phantom_err_mm[xi], phantom_err_mm[yi], "x", color="#ff7f0e",
-                ms=10, mew=2, label=f"Recov. phantom Δ ({err_norm_mm:.3f} mm)")
-        ax.legend(fontsize=8, loc="upper right")
+                ms=9, mew=2, label=f"recov. anatomy Δ ({err_norm_mm:.3f} mm)")
+
+    # One compact, shared legend (the three panels use identical markers, so a
+    # legend per panel just adds clutter).  Anchored in the axial panel's
+    # upper-right corner (dark background, tool sits lower-left) with shrunk
+    # marker icons so the entries don't pile on top of each other.
+    handles, labels = ax_xy.get_legend_handles_labels()
+    ax_xy.legend(handles, labels, loc="upper right", fontsize=7,
+                 markerscale=0.6, labelspacing=0.3, handlelength=1.6,
+                 handletextpad=0.5, borderpad=0.4, framealpha=0.9)
+
+    # Text panel: the deliverable transforms + clinical check
+    ax_txt.axis("off")
+    ax_txt.text(0.0, 1.0, "\n".join(summary_lines), transform=ax_txt.transAxes,
+                fontsize=10, family="monospace", va="top", ha="left")
 
     fig.suptitle(
-        f"Robot EE relative to recovered anatomy frame  |  "
-        f"world ||err|| = {err_norm_mm:.3f} mm  |  background: {plot_method}",
-        fontsize=11,
+        f"Robot tool in the recovered anatomy frame  |  "
+        f"registration world ||err|| = {err_norm_mm:.3f} mm  |  "
+        f"background: {plot_method}",
+        fontsize=12,
     )
-    fig.tight_layout()
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
     fig.savefig(LAYOUT_PNG, dpi=120, bbox_inches="tight")
     print(f"Saved {LAYOUT_PNG}")
     if show:
@@ -382,6 +446,8 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--show", action="store_true",
                         help="Open the layout plot in an interactive window")
+    parser.add_argument("--no-plot", action="store_true",
+                        help="Skip the deliverable layout figure entirely")
     args = parser.parse_args()
 
     pose = load_pose_json()
@@ -533,13 +599,75 @@ def main() -> int:
     print(f"Wrote {RESULT_JSON}")
 
     # ─── plot ───────────────────────────────────────────────────────────────
+    if args.no_plot:
+        return 0
+
     phantom_err_world_m = np.asarray(ig["phantom_pos_recovered_world_m"]) \
                           - np.asarray(ig["phantom_pos_world_m"])
     phantom_err_world_mm = phantom_err_world_m * 1000.0
+
+    # Tool shaft as an oriented needle in the recovered anatomy frame.
+    # The endo360 TCP (EE prim) is the tip; the shaft extends along EE-local
+    # -Z (see CLAUDE.md: mesh occupies local z ∈ [-51.5, -1.0] mm).  Draw the
+    # rear of the shaft (-45 mm) to a hair past the tip (+5 mm) so orientation
+    # is visible in every panel.
+    ee_anatomy_mm = np.asarray(clin["ee_pos_in_anatomy_mm_recovered"])
+    shaft_local_mm = np.array([[0.0, 0.0, 5.0], [0.0, 0.0, -45.0]])
+    tool_seg_anatomy_mm = shaft_local_mm @ T_R_in_A_rec.R.T \
+                          + (T_R_in_A_rec.t * 1000.0)
+    # Ground-truth tool pose (from Isaac Sim's known anatomy pose) for the
+    # overlay — at this accuracy it sits on top of the estimate; under noise
+    # or a harder start the two separate, making the error visible.
+    ee_anatomy_gt_mm = T_R_in_A_gt.t * 1000.0
+    tool_seg_gt_anatomy_mm = shaft_local_mm @ T_R_in_A_gt.R.T \
+                             + (T_R_in_A_gt.t * 1000.0)
+
+    def _v(t):
+        return "[" + ", ".join(f"{x:7.2f}" for x in t) + "]"
+
+    def _q(q):
+        return "[" + ", ".join(f"{x:6.3f}" for x in q) + "]"
+
+    tra = T_R_in_A_rec.to_dict()
+    tac = T_A_in_C_rec.to_dict()
+    trc = T_R_in_C.to_dict()
+    summary_lines = [
+        "DELIVERABLE — recovered transforms",
+        "(translation mm, rotation quat wxyz)",
+        "-" * 40,
+        "T_anatomy->C-arm",
+        f"  t = {_v(tac['t_mm'])}",
+        f"  q = {_q(tac['R_quat_wxyz'])}",
+        "T_robot->anatomy",
+        f"  t = {_v(tra['t_mm'])}",
+        f"  q = {_q(tra['R_quat_wxyz'])}",
+        "T_robot->C-arm",
+        f"  t = {_v(trc['t_mm'])}",
+        "",
+        "Accuracy vs Isaac Sim ground truth",
+        "-" * 40,
+        f"  registration world ||err|| : {registration_err_norm_mm:7.4f} mm",
+        f"  T_robot->anatomy   ||err|| : {err_T_R_in_A_norm_mm:7.4f} mm",
+        f"  T_anatomy->C-arm   ||err|| : {err_T_A_in_C_norm_mm:7.4f} mm",
+        f"  phantom rotation (geodesic): {rot_err_deg:7.4f} deg",
+        "",
+        f"Clinical check ({clin['method']})",
+        "-" * 40,
+        f"  tool tip @ {_v(ee_anatomy_mm)} mm (anatomy)",
+    ]
+    if clin["method"] == "ct_mu_lookup":
+        summary_lines.append(
+            f"  local mu = {clin['local_mu_mm_inv']:.4f} /mm")
+    summary_lines += _wrap(f"  -> {clin['interpretation']}", 46)
+
     make_layout_plot(
-        ee_anatomy_mm=np.asarray(clin["ee_pos_in_anatomy_mm_recovered"]),
+        ee_anatomy_mm=ee_anatomy_mm,
+        tool_seg_anatomy_mm=tool_seg_anatomy_mm,
+        ee_anatomy_gt_mm=ee_anatomy_gt_mm,
+        tool_seg_gt_anatomy_mm=tool_seg_gt_anatomy_mm,
         phantom_err_mm=phantom_err_world_mm,
         err_norm_mm=err_T_R_in_A_norm_mm,
+        summary_lines=summary_lines,
         show=args.show,
     )
     return 0

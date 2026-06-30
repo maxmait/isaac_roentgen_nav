@@ -66,10 +66,16 @@ using simulated fluoroscopy (DRR) and 2D/3D CT registration — entirely in soft
     register_phantom_multiview.py  # Phase 5: clinical sequential AP + lateral C-arm shots
     run_register_multiview.sh      # docker run wrapper for the multi-view registration
     plot_registration_multiview.py # host-side: per-view losses + per-view target/recovered/diff panels
+    plot_capture_range.py          # Phase 5n: host-side basin-of-attraction curve + final-vs-init
+                                   # scatter (reads registration_multiview/capture_range.json)
     build_tool_stamp.py            # Phase 5m: host-side — voxelize tool_mesh.*.npy via trimesh →
                                    # output/tool_stamp.{npy,json} (EE-local μ-volume stamp)
     compute_robot_to_anatomy.py    # Phase 5 deliverable: composes registered phantom with EE pose
                                    # → T_R^A, T_R^C, T_A^C + clinical inside/outside check
+    register_oneshot.py            # Phase 5o: ONE-BUTTON driver — capture C-arm shots from the
+                                   # live scene (TCP) → run_register_multiview.sh → compute_robot_
+                                   # to_anatomy.py → print T_A^C/T_R^A/T_R^C. --no-capture reuses
+                                   # an existing pose.json; --synthetic/--noise/--views/--n-iters.
     ct_loader.py                   # Phase 5d: DICOM CT → PreprocessedVolume (cropped ROI or full)
     run_load_ct.sh                 # docker wrapper to pre-warm the CT cache (one-time)
                                    # CT_FULL_VOLUME=1 → full 797×512×512 native-spacing volume
@@ -495,6 +501,38 @@ needing a separate GUI session.
       When GT=0 (default test case) behaviour is identical to before.
       init_err_norm_mm in the trace now reports the true initial error
       ||init_trans − gt_translation_mm|| rather than ||INIT_OFFSET_MM||.
+- [x] Phase 5n — validation realism (Step 1) + capture-range study (Step 2).
+      Both address the honest-validation gap: the headline sub-10 µm errors
+      were measured under an "inverse crime" (target and optimiser share the
+      same clean renderer) with noise-free DRRs.
+      Step 1 (DRR_NOISE=1): degrade_target_drrs() in
+      register_phantom_multiview.py perturbs ONLY the target images — Gaussian
+      detector-PSF blur (DRR_BLUR_SIGMA_PX) → quantum Poisson photon noise
+      (DRR_PHOTON_COUNT photons/px, signal-dependent std) → optional
+      low-frequency scatter pedestal (DRR_SCATTER_FRAC) — in the optimiser's
+      normalised [0,1] image space. The optimiser keeps its clean renderer, so
+      the target is no longer exactly reproducible → the registration now
+      solves a realistic ill-posed problem. Phenomenological (not a photon
+      Monte-Carlo), but enough to break the inverse crime. Off by default
+      (DRR_NOISE=0) so clean-case results stay reproducible; DRR_NOISE_SEED>=0
+      fixes the realisation.
+      Step 2 (CAPTURE_RANGE=1): the optimisation loop was refactored out of
+      main() into module-level run_optimization() (reused by the sweep AND, in
+      future, a real-time tracking loop — the renderer + targets are built once
+      and reused across samples). run_capture_range() sweeps controlled init
+      offsets from the KNOWN GT pose (CR_TRANS_RADII_MM radii × CR_N_SAMPLES
+      random directions, + CR_ROT_OFFSET_DEG rotation perturbation) and records
+      per-radius success rate (‖t_err‖ < CR_SUCCESS_MM AND geodesic rot err <
+      CR_SUCCESS_DEG). This deliberately uses GT to place inits at known
+      distances — it measures the optimiser's basin of attraction, NOT a
+      deployment run. Writes output/registration_multiview/capture_range.json;
+      plot_capture_range.py renders the basin curve + final-vs-init scatter.
+      Both verified end-to-end on the synthetic phantom via Docker (GPU);
+      run_register_multiview.sh forwards all DRR_*/CR_*/CAPTURE_RANGE vars.
+      Motivation per the user's vision: continuous ~2 s tracking reuses the
+      previous frame as init (tiny offset → fast 2-view path) and must survive
+      real fluoroscopy noise, so Steps 1+2 are load-bearing for that goal, not
+      just credibility.
 
 ### Phase 6: Neural Network Acceleration 🔲 (optional/future)
 - [ ] Generate training dataset: random poses → DRR pairs
@@ -585,6 +623,10 @@ needing a separate GUI session.
 | 2026-05-30 | Phase 5m: synthetic shaft extension (50 mm × 5 mm) added to the stamp | ✅ build_tool_stamp.py grows the stamp grid in EE-local −z and adds a cylinder beyond the real tip mesh.  Defaults SHAFT_LENGTH_MM=50, SHAFT_RADIUS_MM=5 → total tool 100 mm.  Stamp 627 KB (was 322).  On full-CT registration with the live scene: AP mask 2.43%, ry+45° 0.96%, lateral 0.21% — shaft silhouette varies dramatically per view (the visual cue the user wanted).  Convergence ALSO improved on full CT: 0.004 mm / 0.000° (vs 0.109 mm / 0.020° with cropped CT + tip-only).  On cropped CT (128 mm cube) the shaft mostly lands OUTSIDE the volume and is silently clipped (only 1.3k of 62k stamp voxels make it into the μ-volume) — the DRR looks identical to tip-only.  CT_FULL_VOLUME=1 needed to see the shaft.  Disable shaft entirely with SHAFT_LENGTH_MM=0. |
 | 2026-06-01 | Phase 5m: TOOL_MESH_PRIMS knob + multi-prim concatenation in extract_tool_mesh.py | ✅ Comma-separated USD paths; each mesh gets its own world→EE-local transform; faces re-offset and concatenated; per-mesh reconstruction sanity-check (< 1 µm). Default unchanged (tip only). Tested with [link_0, link_1]: combined 367k verts / 122k faces / 80×90×612 mm extent — extraction succeeds, but voxelizing the resulting mesh at 0.5 mm exhausts laptop RAM (OOM killed even with 16 GB swap). Mitigation: chunked trimesh.contains() via CONTAINS_CHUNK env (default 50,000) so peak memory stays bounded. For "full real tool" use STAMP_SPACING_MM=2.0 + small chunks. |
 | 2026-06-01 | Phase 5m: 3-way tool-scope comparison on full CT, live medical_scene | ✅ Identical blind 19.7 mm/5.8° start, 200 iters: none → 0.0003 mm / 47 s; tip+50mm shaft (current) → 0.0037 mm / 47 s; tip+200mm shaft (big) → 0.0039 mm / 45 s. Wall time identical; tool painting costs ~10× in final precision but stays well sub-mm. Big tool only adds visible silhouette on AP (mask 2.4% → 3.5%); lateral/oblique unchanged because extra shaft length extends outside even the full CT. paint_stamp_into_mu() silently drops out-of-volume stamp voxels. |
+| 2026-06-30 | Phase 5n Step 1: DRR_NOISE target degradation (break inverse crime) | ✅ degrade_target_drrs() in register_phantom_multiview.py: PSF blur + Poisson photon noise + optional scatter, applied to TARGET DRRs only (optimiser renderer stays clean). Env DRR_NOISE/DRR_BLUR_SIGMA_PX/DRR_PHOTON_COUNT/DRR_SCATTER_FRAC/DRR_NOISE_SEED, forwarded by run_register_multiview.sh. Off by default (clean-case reproducible). Smoke-tested via Docker GPU on synthetic phantom (12 iters). |
+| 2026-06-30 | Phase 5n Step 2: capture-range / basin-of-attraction study | ✅ Extracted optimisation loop into module-level run_optimization() (renderer+targets built once, reused per sample — also the basis for a future real-time loop). run_capture_range() sweeps CR_TRANS_RADII_MM × CR_N_SAMPLES random init dirs (+CR_ROT_OFFSET_DEG) from KNOWN GT, records per-radius success rate. CAPTURE_RANGE=1 writes capture_range.json; plot_capture_range.py renders basin curve + final-vs-init scatter. Smoke-tested via Docker GPU (radii 5/15, 2 samples, 12 iters → JSON well-formed). Single-run path unchanged (calls run_optimization). NOTE: a real study needs N_ITERS≈150-200 — the 12-iter smoke "FAIL"s are expected. |
+| 2026-06-30 | Phase 5o: one-button register_oneshot.py driver | ✅ Host-side orchestrator chains capture (TCP-inject rotate_carm + add_carm_shot to sweep C-arm 0/45/90° → pose.json) → run_register_multiview.sh (Docker) → compute_robot_to_anatomy.py, then prints a RESULT block (T_A^C/T_R^A/T_R^C + reg error + clinical check). Flags: --no-capture/--synthetic/--full-ct/--noise/--views/--n-iters. Register+compose+result chain smoke-tested end-to-end via --no-capture --synthetic (12 iters). Capture stage not run here (no live GUI on 8226) — it replicates the proven manual Workflow A; ConnectionRefused handled with a clear message. |
+| 2026-06-30 | Phase 5o: deliverable figure upgrade in compute_robot_to_anatomy.py | ✅ robot_to_anatomy_layout.png is now a 2×2: axial+coronal+SAGITTAL CT μ-slices through the isocenter (added sagittal mu[:,:,x0]) + a text panel with the 3 recovered transforms, per-transform error vs GT, and the clinical inside-bone check. Tool drawn as an ORIENTED needle (shaft along EE-local −Z, per Phase 5m) not just a tip dot. GT tool overlay (red open circle + dashed shaft from T_R_in_A_gt) sits under the estimate (green tip + cyan shaft) so estimate-vs-truth agreement is visible; legend shows Δest mm. One compact shared legend on the axial panel only (was 3 oversized per-panel legends; markerscale 0.6). New --no-plot flag on both compute_robot_to_anatomy.py and register_oneshot.py (forwarded); register_oneshot RESULT block prints the figure path. Verified on the cropped-CT trace (0.124 mm → estimate/GT coincide). Committed image: docs/images/robot_to_anatomy_layout.png. |
 
 ---
 
@@ -944,6 +986,21 @@ Both previously known simplifications are now closed:
 The registration ALGORITHM is identical to what would be used clinically;
 both fixes affected *input realism*, not *whether the math works*.
 
+3. **Inverse crime + noise-free DRRs** — ⚠️ **Mitigated, not fully closed
+   (Phase 5n Step 1).**  By default the target DRRs and the optimiser's DRRs
+   come from the SAME clean fluorosim renderer, with no photon noise, scatter,
+   blur, or beam hardening.  This is why the headline errors are sub-10 µm —
+   that number measures *optimiser self-consistency*, not registration accuracy
+   under realistic conditions.  DRR_NOISE=1 now perturbs the target images
+   (PSF blur + Poisson noise + scatter) so the optimiser can no longer exactly
+   reproduce them — a genuine break of the inverse crime.  Still NOT closed:
+   the degradation is phenomenological (applied in [0,1] display space, not a
+   physical photon Monte-Carlo), and target+optimiser still use the SAME
+   forward projector (only the IMAGE is degraded, not the physics). A full fix
+   would render the target with an independent forward model (different ray
+   stepping / spectrum). Use `CAPTURE_RANGE=1 DRR_NOISE=1` to report accuracy
+   AND basin under noise — that pairing is the honest headline number.
+
 ---
 
 ## Key Commands
@@ -1038,6 +1095,40 @@ DICOM_PATH=~/medical_imaging/spine_mets_ct_seg/10250/04098/27242 \
 # Plot multi-view results (host-side) — 4th panel shows rotation error;
 # images.png gets a 4th column with the red tool-mask overlay when painted:
 python3 ~/isaac_projects/bridge/plot_registration_multiview.py
+
+# === Phase 5o: ONE-BUTTON registration (live scene → transforms) ===
+# Pose the robot in the Isaac Sim GUI (medical_scene.usd), then run ONE command.
+# It sweeps the C-arm to 0/45/90°, captures pose.json, registers, and composes
+# T_anatomy→C-arm / T_robot→anatomy / T_robot→C-arm + clinical check.
+python3 ~/isaac_projects/bridge/register_oneshot.py                 # real spine CT, 3 views
+python3 ~/isaac_projects/bridge/register_oneshot.py --noise         # + realistic target noise
+python3 ~/isaac_projects/bridge/register_oneshot.py --no-capture    # reuse existing pose.json
+python3 ~/isaac_projects/bridge/register_oneshot.py --synthetic --views 0,60,120 --n-iters 250
+# Needs: Isaac Sim GUI live on 127.0.0.1:8226 with a /World/CArm prim (for
+# capture); Docker + fluorosim-torch (for register).  --no-capture skips the GUI.
+
+# === Phase 5n: validation realism + capture-range study ===
+# Step 1 — add realistic fluoroscopy degradation to the TARGET DRRs only
+# (breaks the "inverse crime"; optimiser keeps the clean renderer):
+DICOM_PATH=~/medical_imaging/spine_mets_ct_seg/10250/04098/27242 \
+    USE_POSE_JSON=1 N_ITERS=200 \
+    DRR_NOISE=1 DRR_PHOTON_COUNT=10000 DRR_BLUR_SIGMA_PX=0.7 DRR_NOISE_SEED=0 \
+    ~/isaac_projects/bridge/run_register_multiview.sh
+#   Lower DRR_PHOTON_COUNT = noisier (e.g. 2000 ≈ low-dose pulsed fluoro).
+#   Add DRR_SCATTER_FRAC=0.05 for a low-frequency scatter pedestal.
+
+# Step 2 — capture-range / basin-of-attraction sweep (NOT a single run).
+# Sweeps controlled init offsets from the KNOWN GT pose; writes
+# output/registration_multiview/capture_range.json.  Combine with DRR_NOISE=1
+# to measure the basin UNDER noise.
+DICOM_PATH=~/medical_imaging/spine_mets_ct_seg/10250/04098/27242 \
+    USE_POSE_JSON=1 N_ITERS=200 \
+    CAPTURE_RANGE=1 CR_TRANS_RADII_MM="5,10,20,30,40,60" CR_N_SAMPLES=8 \
+    CR_ROT_OFFSET_DEG=5 CR_SUCCESS_MM=1.0 CR_SUCCESS_DEG=1.0 CR_SEED=0 \
+    ~/isaac_projects/bridge/run_register_multiview.sh
+# Plot the basin curve + final-vs-init scatter (host-side, needs matplotlib):
+python3 ~/isaac_projects/bridge/plot_capture_range.py          # saves capture_range.png
+python3 ~/isaac_projects/bridge/plot_capture_range.py --show   # interactive window
 
 # Phase 5 deliverable: compute T_robot_to_anatomy from registration + pose.json
 # (host-side, no Docker). Falls back to single-view if multi-view absent.
