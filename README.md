@@ -16,18 +16,16 @@ position robot and C-arm in the GUI, capture two (or more) C-arm angles as
 separate shots, and the multi-view 6-DOF registration recovers both translation
 and phantom orientation from those shots. See the [Quick start](#quick-start--full-end-to-end) below.
 
-**Headline results** — 6-DOF multi-view registration on the real spine CT:
+**Headline results** — 6-DOF registration on the real spine CT (RTX 4060 Laptop, 8 GB):
 
-| Volume / scene | Trans ‖err‖ | Rot ‖err‖ | Time |
+| Scenario | Trans ‖err‖ | Rot ‖err‖ | Time |
 |---|---|---|---|
-| Synthetic ellipsoid + Franka rest pose | **0.07 mm** | — (symmetric, no signal) | ~8 s |
-| Real spine CT — cropped 128 mm³ ROI (3-DOF) | **0.037 mm** | — | 9.4 s |
-| Real spine CT — 6-DOF, 200 iters | **0.016 mm** | **0.020°** | 15.2 s |
-| Real spine CT — full 797×512×512 (3-DOF) | **0.076 mm** | — | 15.6 s |
-| Medical scene (STAR + spine on table) | **0.096 mm** | — | ~10 s |
-| Medical scene + real endo360 tool mesh in target | **0.004 mm** | **0.000°** | ~47 s |
+| Real spine CT — 6-DOF, 200 iters | **0.016 mm** | **0.020°** | ~15 s |
+| Real spine CT — full 797×512×512 volume | **0.076 mm** | — | ~16 s |
+| Medical scene + real endo360 tool in target | **0.004 mm** | **0.000°** | ~47 s |
 
-All on an RTX 4060 Laptop GPU (8 GB VRAM). The full CT volume fits with room to spare.
+These are the clean-target numbers; see the [Validation Record](docs/VALIDATION.md)
+for the full test set, methodology, and accuracy under realistic fluoroscopy noise.
 
 ---
 
@@ -98,32 +96,18 @@ relative to the C-arm — the real unknown in any fluoroscopy-guided procedure.
 
 ## Clinical faithfulness
 
-> *Are we feeding the registration information that a real OR wouldn't have
-> — especially the phantom isocenter pose?*
+Is the registration fed information a real OR wouldn't have — especially the
+anatomy pose? **No.** The optimizer never reads the ground-truth `phantom_pos`;
+it sees only the CT μ-volume, the target X-rays, and a blind initial guess (the
+C-arm isocenter + a fixed planning offset). The ground-truth pose in `pose.json`
+is used *only* to score accuracy afterwards — the role a real independent
+tracker would play. Every registration input (EE pose from FK, C-arm pose from
+hand-eye calibration, gantry angle from encoders, CT μ-volume, X-ray physics)
+maps to a real-OR counterpart.
 
-**Short answer: no.** The `phantom_pos` field in `pose.json` is used in
-two roles that are easy to conflate but are distinct:
-
-| Use of `phantom_pos` | Role | Real-life analog |
-|---|---|---|
-| fluorosim renders target DRRs at this pose | Where the anatomy sits in the simulated world | The physical patient — no "knowledge" required, the X-ray hits it regardless |
-| `compute_robot_to_anatomy.py` compares GT vs recovered | Accuracy scoring | An independent precision measurement (optical tracker, CMM) — present only for evaluation |
-
-The optimizer never reads `phantom_pos`. It sees only the CT μ-volume, the
-target images, and an initial translation guess. Convergence to 16 µm / 0.02°
-is recovery from the images alone.
-
-Full input audit:
-
-| Input | Sim source | Real-OR source | Realistic? |
-|---|---|---|---|
-| Robot EE pose | Isaac Sim FK | Joint encoders → FK | ✓ |
-| C-arm pose | Set in `pose.json` | Hand-eye calibration C-arm ↔ robot (one-time) | ✓ |
-| C-arm gantry angle per shot | Captured from USD prim | Gantry encoders | ✓ |
-| CT μ-volume | Real DICOM spine CT or synthetic cache | Pre-op CT, segmented HU→μ | ✓ (mechanism identical) |
-| Target X-ray | Rendered by fluorosim | Actual X-ray photons | ✓ (same Beer–Lambert physics) |
-| Optimizer initial guess | C-arm isocenter + `INIT_OFFSET_MM` | Planning prior or "anatomy at isocenter" | ✓ blind — never derived from GT (GT used only to score) |
-| Ground-truth phantom pose (for scoring) | `pose.json` | Sim-only — NOT used by the optimizer | Validation reference only |
+The full input audit and the honesty caveats (inverse crime, noise-free DRRs,
+unmodelled FK/calibration error) are documented in the
+[Validation Record](docs/VALIDATION.md#known-simplifications-what-is-not-yet-real).
 
 ---
 
@@ -319,144 +303,25 @@ python3 scenes/take_snapshot.py my_snapshot.jpg
 
 ---
 
-## Results
+## Validation
 
-### Multi-view vs single-view
+The pipeline is validated by a documented set of tests — projection geometry,
+convergence, single- vs multi-view depth ambiguity, 6-DOF registration, real CT
+integration, tool realism, blind initialization, and a capture-range / noise
+study. Full method, configuration, and per-test numbers live in the
+**[Validation Record](docs/VALIDATION.md)**. Highlights:
 
-A single AP shot cannot resolve translation along the X-ray beam axis (depth
-ambiguity). The 90° lateral shot collapses it:
-
-| Method | x err | y err | **z err** | ‖err‖ |
-|---|---|---|---|---|
-| Single view (AP only) | 0.04 mm | 0.02 mm | **0.41 mm** | 0.41 mm |
-| **AP + Lateral (sequential)** | 0.04 mm | −0.03 mm | **0.01 mm** | **0.05 mm** |
-
-Z is the *most-constrained* axis with two views because it is in-plane in the
-lateral view and its gradient is strong there.
-
-### 6-DOF registration — translation + rotation
-
-The optimizer jointly recovers phantom translation and orientation (3 + 3 DOF)
-using a shared `phantom_rot` (ZXY Euler) parameter. Per-view composition
-ensures each rendered DRR uses the correct effective viewing angle through the
-rotated anatomy. The rotation backward path in Slang's autodiff produces NaN
-in some configurations; these are detected and zeroed out so the optimizer
-continues cleanly.
-
-On the real spine CT with `N_ITERS=200` (needed to untangle the
-rotation-translation coupling):
-
-| | Init | Final |
-|---|---|---|
-| Translation ‖err‖ | 19.7 mm | **0.016 mm** |
-| Rotation ‖err‖ (geodesic) | 5.83° | **0.020°** |
-| Wall time | — | 15.2 s (76 ms/iter) |
-
-![6-DOF convergence (4 panels)](docs/images/registration_6dof_convergence.png)
-
-*Left to right: total MSE loss, per-view loss (AP / lateral), translation error
-per axis, rotation error per axis. The optimizer oscillates until ~iter 120 as
-rotation and translation untangle, then converges sharply.*
-
-![6-DOF DRR comparison](docs/images/registration_6dof_images.png)
-
-*AP (top) and lateral (bottom): target | recovered | |diff|. The |diff| max of
-0.015 (AP) and 0.010 (lateral) is near the noise floor of the differentiable
-renderer.*
-
-### Real tool in the registration target — clinical fluoroscopy realism
-
-The target images now look like an actual intra-op X-ray with the endoscope
-inserted. The endo360 tip mesh is extracted from the live Isaac Sim scene into
-an EE-local voxel stamp (`scenes/extract_tool_mesh.py` →
-`bridge/build_tool_stamp.py`); at registration time the stamp is splatted into
-the μ-volume at the current EE pose, the steel tool occludes the underlying
-anatomy, and a per-view tool mask zeros out the tool's pixels in the loss so
-the optimizer matches anatomy only. After convergence the recovered DRR is
-re-rendered with the tool at the *recovered* EE voxel — at sub-voxel agreement
-with the target, the two look identical.
+- **6-DOF on real spine CT** — 19.7 mm / 5.83° → **0.016 mm / 0.020°** (200 iters, ~15 s).
+- **Second orthogonal view** collapses single-view depth ambiguity (0.41 mm → 0.05 mm); a **third oblique** view is required for robust *blind* 6-DOF (two views can stall at ~2 mm / 6°).
+- **Blind initialization** — the optimizer never uses ground truth to start; GT scores only.
+- **Clinical fluoroscopy realism** — the real endo360 tool is painted into the target X-rays and masked out of the loss, with no change to the recovered pose.
+- **Capture range ≈ 60 mm, noise-robust** — a basin-of-attraction study (clean vs realistic photon noise) shows 100% convergence for mm-scale offsets with microns of error, essentially unaffected by detector noise at 10 000 photons/px.
 
 ![Registration target with the real endo360 tool](docs/images/registration_with_real_tool.png)
 
-*Three rows = three C-arm angles (AP / 45° / 90°). Columns = target with tool |
-recovered with tool | |diff| | tool mask used in the loss. The dark elongated
-opacity is the real endoscope tip + a synthetic shaft extension (the housing
-beyond ~100 mm is mostly outside even the full CT volume and gets silently
-clipped — see the project log). Mask coverage varies dramatically per view
-(3.5% AP / 1.0% oblique / 0.2% lateral) which is the visual cue a surgeon uses
-to recognize the tool from any C-arm angle.*
-
-Three tool-scope options, all converging to sub-µm from a 19.7 mm / 5.8° blind
-start on the live medical scene + full CT, 200 iters:
-
-| Tool scope | Final ‖t_err‖ | Final ‖r_err‖ | Wall time | AP mask |
-|---|---|---|---|---|
-| `none` (no tool painting) | **0.0003 mm** | 0.0000° | 47 s | — |
-| `current` (real tip + 50 mm synthetic shaft, 100 mm) | **0.0037 mm** | 0.0000° | 47 s | 2.4% |
-| `big` (real tip + 200 mm synthetic shaft, 250 mm) | **0.0039 mm** | 0.0000° | 45 s | 3.5% |
-
-Tool-driven DRR↔robot pose refinement is the natural follow-on: a tool-only
-differentiable render against the same μ-volume already exists (it's how the
-mask is built), so a gradient against the EE pose itself would pull the
-robot's hand to match the X-ray silhouette — closing the loop between
-fluoroscopic anatomy localization and robot-side calibration.
-
-### Blind initialization and the need for a third view
-
-The optimizer is initialized **without any knowledge of the ground-truth
-anatomy pose** — it starts from the C-arm isocenter plus a fixed planning
-offset (`INIT_OFFSET_MM`), exactly as a real procedure would (the C-arm is
-parked roughly over the patient; the true anatomy pose is the unknown being
-solved for). Ground truth is used only to *score* the result.
-
-Validated end-to-end on a live Isaac Sim scene: the C-arm was physically moved
-**+30 mm** off the spine in the GUI, captured to `pose.json`, and registered on
-the real spine CT from a genuinely blind 28 mm start.
-
-This honest setup surfaced a real property of two-view 6-DOF registration:
-
-| Views | Trans ‖err‖ | Rot ‖err‖ | Outcome |
-|---|---|---|---|
-| AP + lateral (0°, 90°) | 2.06 mm | 6.15° | **stuck** — in-plane tx↔ry coupling local minimum |
-| AP + **oblique** + lateral (0°, 45°, 90°) | **0.003 mm** | **0.000°** | clean convergence |
-
-Two orthogonal views leave an ambiguity between in-plane translation and
-rotation (a few-mm shift looks almost identical to a few-degree rotation in
-both projections); the depth offset is recovered but `tx`/`ry` drift together.
-A single oblique view breaks it. **Three views (one oblique) is therefore the
-default and recommended workflow for robust blind 6-DOF registration** —
-`VIEWS_DEG_Y` defaults to `0,45,90`. (The two-view case is still fine when the
-starting pose is already close to the answer.)
-
-### T_robot_in_anatomy — end-to-end on a real Isaac Sim scene
-
-```
-T_robot_in_anatomy.t  (mm)
-         Ground truth:  [  0.623,  15.397,  -2.932 ]
-            Recovered:  [  0.659,  15.363,  -2.919 ]
-     Per-axis error:    [  0.036,  -0.033,   0.013 ]
-         ‖error‖:       0.051 mm
-
-Clinical: Tool tip is INSIDE the bone core (normalized distance 0.77).
-```
-
-### Simulation simplifications — both previously known gaps are now closed
-
-The two places where the simulation used to be more permissive than a clinical
-setting have both been addressed without changing the registration algorithm
-itself; only the input realism changed:
-
-1. **Tool in the registration target image** — ✅ *fixed (Phase 5l + 5m)*.
-   The target DRRs now show the real endo360 tip mesh (extracted from the live
-   STAR robot) plus a synthetic shaft, so they look like fluoroscopy with the
-   tool inserted. A per-view tool mask, derived from a tool-only differentiable
-   render of the same μ-volume, zeros the tool's pixels out of the loss so the
-   optimizer only matches anatomy. See [Real tool in the registration target](#real-tool-in-the-registration-target--clinical-fluoroscopy-realism)
-   above for the images and numbers.
-2. **Optimizer initialization** — ✅ *fixed*. The optimizer starts from the
-   C-arm isocenter plus a fixed planning offset; ground truth is used only for
-   scoring, never construction. See [Blind initialization](#blind-initialization-and-the-need-for-a-third-view)
-   above.
+*Three C-arm angles (rows: AP / 45° / 90°); columns: target with tool |
+recovered | |diff| | tool mask. Details in the
+[Validation Record](docs/VALIDATION.md#v6--tool-in-the-registration-target-clinical-realism).*
 
 ---
 
@@ -497,7 +362,9 @@ isaac_roentgen_nav/
 │   ├── build_tool_stamp.py            # host: voxelize EE-local mesh → tool_stamp.npy
 │   ├── ct_loader.py                   # DICOM CT → PreprocessedVolume (cropped or full)
 │   └── run_load_ct.sh                 # one-time CT cache builder
-├── docs/images/                       # committed reference images for this README
+├── docs/
+│   ├── VALIDATION.md                  # full test record (methods, configs, results)
+│   └── images/                        # committed reference images for this README
 ├── output/                            # runtime artifacts — gitignored
 ├── CLAUDE.md                          # detailed implementation log, gotchas
 ├── pyproject.toml
