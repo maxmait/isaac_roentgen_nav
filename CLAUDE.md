@@ -533,11 +533,50 @@ needing a separate GUI session.
       previous frame as init (tiny offset → fast 2-view path) and must survive
       real fluoroscopy noise, so Steps 1+2 are load-bearing for that goal, not
       just credibility.
+- [x] Phase 5p — image-based tool/TCP pose recovery (PoC).
+      bridge/register_tool_pose.py (+ run_register_tool.sh, plot_tool_pose.py)
+      renders the endo360 tool stamp as its OWN differentiable volume and
+      optimises its 6-DOF pose (per-view gantry composition, same Adam loop as
+      the anatomy registration) to match the observed tool silhouette across
+      C-arm views → an image-based tool pose INDEPENDENT of FK (the first step
+      toward cross-checking/replacing the FK + hand-eye calibration term).
+      Self-contained: only needs output/tool_stamp.npy + a GPU (no CT).
+      Corrects the old "blocked" note — the non-differentiable scipy affine in
+      paint_stamp_into_mu was only for baking the tool into anatomy; rendering
+      the tool as its own volume with the Slang renderer's differentiable
+      (euler, translation) inputs works.  KEY: the transmittance silhouette
+      loss (normalize=False, invert=False) does NOT need the Slang gradient
+      sign-flip the anatomy normalize=True path needs — FLIP_GRAD default 0
+      (with flip it diverges).  Init = FK prior + residual (thin rod → small
+      basin → a refinement, not a blind global search).  Result (init
+      5.8 mm/5.6°, 200 iters): multi-view TCP tip 0.113 mm, pointing 0.0001°,
+      perp-to-axis 0.0001 mm — the ENTIRE residual is along-axis (0.113 mm,
+      the rod's weakly-constrained slide DOF, analogous to roll); single view
+      3.23 mm/1.28° (depth ambiguity, mirrors V3).  Docs: VALIDATION.md V10 +
+      docs/images/tool_pose_recovery.png.  Follow-ons: confidence-based
+      FK-fallback fusion, live re-posed scene, DRR_NOISE on the silhouette.
 
 ### Phase 6: Neural Network Acceleration 🔲 (optional/future)
 - [ ] Generate training dataset: random poses → DRR pairs
-- [ ] Train pose regression network
+- [ ] Train pose regression network (instant registration initialiser or full
+      estimate) so any internet CT works without per-case manual setup
 - [ ] Compare vs classical registration baseline
+- Note: the capture-range study (V9) quantifies how good an initialiser needs
+  to be (basin ~60 mm), i.e. whether a NN initialiser is even required.
+
+### Phase 7: ROS / RViz Visualization & Integration 🔲 (future)
+- [ ] Minimal ROS 2 (Humble) bridge: a TF-broadcaster node that reads
+      output/robot_to_anatomy.json and publishes T_R^A / T_A^C / T_R^C as a TF
+      tree; STAR robot URDF via robot_state_publisher; CT anatomy as a mesh
+      MarkerArray; C-arm + recovered tool as frames → view live in rviz2.
+- [ ] Isaac ROS layer (heavier): live Isaac Sim ↔ ROS 2 bridge to stream the
+      scene/camera in real time + GPU-accelerated perception — earns its weight
+      once the real-time tracking loop exists.
+- [ ] Natural substrate for the navigation/trajectory-planning end goal
+      (MoveIt consumes the TF tree + anatomy for motion planning).
+- Rationale: the three recovered transforms map directly onto a ROS TF tree, so
+  RViz is the standard, compelling way to visualise robot + anatomy + tool + C-arm
+  together.  Start minimal (rviz2 + TF); add Isaac ROS for the live bridge.
 
 ---
 
@@ -629,6 +668,7 @@ needing a separate GUI session.
 | 2026-06-30 | Phase 5o: deliverable figure upgrade in compute_robot_to_anatomy.py | ✅ robot_to_anatomy_layout.png is now a 2×2: axial+coronal+SAGITTAL CT μ-slices through the isocenter (added sagittal mu[:,:,x0]) + a text panel with the 3 recovered transforms, per-transform error vs GT, and the clinical inside-bone check. Tool drawn as an ORIENTED needle (shaft along EE-local −Z, per Phase 5m) not just a tip dot. GT tool overlay (red open circle + dashed shaft from T_R_in_A_gt) sits under the estimate (green tip + cyan shaft) so estimate-vs-truth agreement is visible; legend shows Δest mm. One compact shared legend on the axial panel only (was 3 oversized per-panel legends; markerscale 0.6). New --no-plot flag on both compute_robot_to_anatomy.py and register_oneshot.py (forwarded); register_oneshot RESULT block prints the figure path. Verified on the cropped-CT trace (0.124 mm → estimate/GT coincide). Committed image: docs/images/robot_to_anatomy_layout.png. |
 | 2026-07-02 | Phase 5n: capture-range basin study executed (clean + noise) | ✅ Full run on cropped spine CT, pose.json GT=0, views 0/45/90, 8 samples/radius, 200 iters, radii 5–80 mm. CLEAN: 100% success ≤30 mm, 88% @40 mm, 100% @60 mm, 75% @80 mm; median ‖err‖ sub-µm to 0.137 mm. NOISE (10 000 photons/px + 0.7 px PSF): success curve IDENTICAL to clean (same 7/8 @40, 6/8 @80) — failures are direction-dependent tx↔ry coupling, not noise; median only rises to ~2–3 µm. Conclusion: basin is geometry-limited (~60 mm reliable), noise-robust at this dose; mm-scale tracking offsets are 100% reliable. Results: output/registration_multiview/capture_range_{clean,noise}.json; figure docs/images/capture_range.png. plot_capture_range.py rewritten to auto-overlay clean vs noise (median + p25–p75 band). |
 | 2026-07-02 | Docs: split validation record out of README | ✅ Created docs/VALIDATION.md — structured per-test record V1–V9 (objective/method/command/result/status) consolidating what was scattered in README + State Log; embeds the 6-DOF + capture-range figures. README trimmed to "Balanced": 3-row headline table, one-paragraph clinical-faithfulness summary (full audit → VALIDATION.md), concise Validation section (4 highlights + tool image), removed the big Results section + duplicate tables. docs/ added to the layout tree. |
+| 2026-07-20 | Phase 5p: image-based tool/TCP pose recovery (PoC) | ✅ New bridge/register_tool_pose.py + run_register_tool.sh + plot_tool_pose.py. Renders the endo360 tool stamp as its OWN differentiable volume and optimizes its 6-DOF pose (per-view gantry composition, same Adam loop as anatomy) to match the observed silhouette — image-based tool pose INDEPENDENT of FK. Self-contained: only needs output/tool_stamp.npy + GPU, no CT. Corrects the memory "blocked" note: NOT blocked — the non-differentiable scipy affine (paint_stamp_into_mu) was only for baking tool into anatomy; rendering the tool as its own volume with differentiable pose inputs works. KEY FIX: the transmittance silhouette loss (normalize=False, invert=False) does NOT need the Slang gradient sign-flip that the anatomy normalize=True/invert=True path needs — FLIP_GRAD default 0 (with flip it diverges/ascends). Init = FK prior + residual (thin rod → small basin → refinement, not blind global search). Result (init 5.8mm/5.6°, 200 iters): multi-view TCP tip 0.113mm, pointing 0.0001°, perp-to-axis 0.0001mm; ENTIRE residual is along-axis (0.113mm) — rod's weakly-constrained slide DOF, analogous to roll. Single-view 3.23mm/1.28° (depth ambiguity, mirrors V3). Docs: VALIDATION.md V10 + docs/images/tool_pose_recovery.png. Follow-ons: FK-fallback fusion, live scene, DRR_NOISE. |
 
 ---
 

@@ -359,6 +359,9 @@ isaac_roentgen_nav/
 │   ├── register_oneshot.py            # host: ONE-BUTTON capture → register → compose
 │   ├── compute_robot_to_anatomy.py    # host: registration → T_R^A, T_R^C, T_A^C + figure
 │   ├── plot_capture_range.py          # host: basin-of-attraction curve + scatter
+│   ├── register_tool_pose.py          # image-based tool/TCP pose recovery (PoC)
+│   ├── run_register_tool.sh           # wrapper for register_tool_pose.py
+│   ├── plot_tool_pose.py              # host: silhouette overlay + convergence
 │   ├── build_tool_stamp.py            # host: voxelize EE-local mesh → tool_stamp.npy
 │   ├── ct_loader.py                   # DICOM CT → PreprocessedVolume (cropped or full)
 │   └── run_load_ct.sh                 # one-time CT cache builder
@@ -442,12 +445,26 @@ isaac_roentgen_nav/
 
 **Next:**
 
-- **Tool-driven DRR ↔ robot pose refinement** — the tool-only render +
-  per-view mask machinery from Phase 5l already gives the tool's silhouette
-  as a differentiable image. A gradient on `ee_pos` / `ee_quat` against the
-  observed tool silhouette in the target X-ray would *recover* the robot's
-  hand pose from fluoroscopy alone — refining FK with a feedback term and
-  closing the loop between fluoroscopic anatomy and robot-side calibration
+- **Tool-driven DRR ↔ robot pose refinement** — ✅ *proof-of-concept done
+  (`bridge/register_tool_pose.py`, Validation V10)*. The tool is rendered as its
+  own differentiable volume and its pose optimized to match the observed
+  fluoroscopy silhouette — an image-based tool/TCP pose **independent of FK**
+  (multi-view: TCP tip 0.11 mm, pointing 0.0001°; roll and along-axis translation
+  are weakly constrained, as expected for a thin rod). Remaining: a
+  confidence-based FK fallback (use the image pose when the tool is in-frame and
+  confident, else the calibration term) and live-scene validation.
+- **ROS / RViz visualization** — publish the recovered transforms as a ROS 2 TF
+  tree (`T_R^A`, `T_A^C`, `T_R^C`) with the STAR robot URDF, the CT anatomy as a
+  mesh marker, and the C-arm + recovered tool as frames, viewed live in RViz. A
+  minimal `rviz2` + TF-broadcaster node (reading `robot_to_anatomy.json`) covers
+  the core visualization; **Isaac ROS** adds the live Isaac Sim ↔ ROS bridge and
+  GPU perception once the real-time tracking loop is in place. This is also the
+  natural substrate for the trajectory-planning goal below (MoveIt).
+- **Neural-network acceleration (Phase 6)** — use the pipeline as a data
+  generator (random poses → DRR pairs) to train a pose-regression network that
+  provides an instant registration initializer (or a full estimate), removing the
+  per-case manual setup so any internet CT can be used for planning. The
+  capture-range study (V9) quantifies how good an initializer needs to be.
 - **Trajectory planning** — consume T_R^A to drive the robot toward a
   surgical target while keeping the tool tip inside a safety region
 

@@ -298,6 +298,59 @@ offsets.*
 
 ---
 
+## V10 — Image-based tool/TCP pose recovery (proof-of-concept)
+
+**Objective.** Recover the tool/TCP pose from its own fluoroscopy silhouette —
+*independent of the robot FK* — so it can later cross-check or replace the FK /
+hand-eye-calibration term (which V8 / simplification #4 currently take as exact).
+
+**Method.** Render the endo360 tool stamp (`output/tool_stamp.npy`) as its own
+differentiable volume and optimize its 6-DOF pose (translation + ZXY-Euler
+rotation in the C-arm base frame) to match the observed tool silhouette across
+views — the same per-view gantry composition and Adam loop as the anatomy
+registration, with the tool as the object. The observed silhouette is the stamp
+rendered at the GT pose (`normalize=False` → transmittance `T=exp(−∫μ)`); loss is
+summed silhouette MSE. Init = FK prior + a residual perturbation (a thin rod has
+a small basin, so this *refines* an approximate pose rather than searching
+globally). GT scores only.
+
+**Command.** `bridge/run_register_tool.sh` (self-contained — needs only the tool
+stamp + GPU; no CT).
+
+**Result** (GT tool pose in-frame; init = FK prior + 5.8 mm / 5.6°; 200 iters):
+
+| Views | TCP tip ‖err‖ | perp-to-axis | along-axis | pointing err | roll |
+|---|---|---|---|---|---|
+| AP + 45° + lateral | **0.113 mm** | 0.000 mm | 0.113 mm | **0.000°** | 0.000° |
+| AP only | 3.23 mm | 0.35 mm | 0.48 mm | 1.28° | — |
+
+![Image-based tool-pose recovery](images/tool_pose_recovery.png)
+
+*Per-view observed (magenta) vs recovered (green) tool silhouettes — they
+coincide (white) — plus convergence. The tool projects to a thin bar at a
+different angle in each view.*
+
+**Findings.**
+- **The observable DOFs are recovered essentially perfectly** — perpendicular
+  position 0.0001 mm and pointing direction 0.0001° (multi-view). Depth is
+  collapsed by multiple views, exactly as for anatomy (V3): a single view gives
+  3.2 mm tip / 1.28° pointing.
+- **Two DOFs are weakly constrained, by the rod geometry** — rotation about the
+  tool's long axis (roll) and translation *along* it. The entire multi-view tip
+  residual (0.113 mm) is along-axis; it is bounded only by the asymmetric bullet
+  tip. These are physical ambiguities of a near-uniform rod, not bugs.
+- **Implementation note:** the transmittance silhouette loss (`normalize=False`,
+  `invert=False`) does **not** need the Slang gradient sign-flip that the anatomy
+  `normalize=True`/`invert=True` path requires (`FLIP_GRAD=0`); with the flip it
+  diverges.
+
+**Status.** ✅ PoC — the mechanism works: image-based tool pose recovered to
+sub-0.12 mm / sub-0.001° in the observable DOFs. Follow-ons (out of scope here):
+confidence metric + FK-fallback fusion, live re-posed medical-scene validation,
+and re-using `DRR_NOISE` for an honest noisy target.
+
+---
+
 ## Known simplifications (what is not yet real)
 
 | # | Simplification | State |
@@ -305,7 +358,7 @@ offsets.*
 | 1 | Tool absent from the target image | ✅ Closed (V6) |
 | 2 | Optimizer init derived from GT | ✅ Closed (V7 — blind init) |
 | 3 | Inverse crime + noise-free DRRs | ⚠️ Mitigated (V9 `DRR_NOISE`), not fully closed — degradation is phenomenological (applied in image space), and target + optimizer still share the same forward projector. A full fix renders the target with an independent forward model. |
-| 4 | FK / hand-eye calibration error | ⚠️ Not modelled — EE pose is taken as exact. In reality FK and C-arm↔robot calibration add to the `T_robot→C-arm` term. Addressed by the planned tool-driven pose refinement. |
+| 4 | FK / hand-eye calibration error | ⚠️ Not modelled — EE pose is taken as exact. In reality FK and C-arm↔robot calibration add to the `T_robot→C-arm` term. **V10** is the first step toward removing this: an image-based tool pose recovered from the fluoroscopy silhouette, independent of FK (PoC done; fusion/fallback pending). |
 
 ---
 
@@ -322,3 +375,4 @@ offsets.*
 | V7 | Blind init + third view | ✅ |
 | V8 | End-to-end `T_robot→anatomy` | ✅ |
 | V9 | Capture range (clean vs noise) | ✅ |
+| V10 | Image-based tool/TCP pose recovery (PoC) | ✅ |
