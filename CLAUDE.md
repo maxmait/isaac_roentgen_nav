@@ -564,11 +564,24 @@ needing a separate GUI session.
 - Note: the capture-range study (V9) quantifies how good an initialiser needs
   to be (basin ~60 mm), i.e. whether a NN initialiser is even required.
 
-### Phase 7: ROS / RViz Visualization & Integration 🔲 (future)
-- [ ] Minimal ROS 2 (Humble) bridge: a TF-broadcaster node that reads
-      output/robot_to_anatomy.json and publishes T_R^A / T_A^C / T_R^C as a TF
-      tree; STAR robot URDF via robot_state_publisher; CT anatomy as a mesh
-      MarkerArray; C-arm + recovered tool as frames → view live in rviz2.
+### Phase 7: ROS / RViz Visualization & Integration 🚧 IN PROGRESS
+- [x] Minimal ROS 2 (Humble) bridge — DONE (first cut).  ros/fluoro_tf_bridge.py
+      (rclpy) reads output/robot_to_anatomy.json and broadcasts, rooted at the
+      anatomy frame: anatomy→tool (recovered T_robot_in_anatomy) and
+      anatomy→carm (inverse of recovered T_anatomy_in_carm), + a MarkerArray
+      (/fluoro_markers): CT surface mesh (output/spine_mesh.obj, metres, at the
+      anatomy origin), tool shaft cylinder + tip sphere (tool frame), C-arm
+      source sphere + beam-axis line, and a TEXT panel with reg ‖err‖ + the
+      clinical check.  Re-reads the JSON at 5 Hz → re-running registration
+      updates RViz live (hook for the tracking loop).  ros/fluoro_scene.rviz
+      (fixed frame=anatomy) + ros/run_rviz.sh launcher.  ROS 2 Humble was
+      already installed at /opt/ros/humble (no apt/sudo needed); rviz2 +
+      robot_state_publisher + tf2_ros + rclpy all present.  Verified headless:
+      /tf + /fluoro_markers publish; tf2_echo anatomy→tool = (-0.092, 0.036,
+      -0.001) m = the recovered tip.  NOTE: no STAR URDF was available (the arm
+      is USD-only in medical_scene.usd), so the robot is represented by the tool
+      markers + TF frames for now; URDF + robot_state_publisher is a follow-on.
+- [ ] STAR robot URDF (USD→URDF) via robot_state_publisher to draw the full arm.
 - [ ] Isaac ROS layer (heavier): live Isaac Sim ↔ ROS 2 bridge to stream the
       scene/camera in real time + GPU-accelerated perception — earns its weight
       once the real-time tracking loop exists.
@@ -669,6 +682,7 @@ needing a separate GUI session.
 | 2026-07-02 | Phase 5n: capture-range basin study executed (clean + noise) | ✅ Full run on cropped spine CT, pose.json GT=0, views 0/45/90, 8 samples/radius, 200 iters, radii 5–80 mm. CLEAN: 100% success ≤30 mm, 88% @40 mm, 100% @60 mm, 75% @80 mm; median ‖err‖ sub-µm to 0.137 mm. NOISE (10 000 photons/px + 0.7 px PSF): success curve IDENTICAL to clean (same 7/8 @40, 6/8 @80) — failures are direction-dependent tx↔ry coupling, not noise; median only rises to ~2–3 µm. Conclusion: basin is geometry-limited (~60 mm reliable), noise-robust at this dose; mm-scale tracking offsets are 100% reliable. Results: output/registration_multiview/capture_range_{clean,noise}.json; figure docs/images/capture_range.png. plot_capture_range.py rewritten to auto-overlay clean vs noise (median + p25–p75 band). |
 | 2026-07-02 | Docs: split validation record out of README | ✅ Created docs/VALIDATION.md — structured per-test record V1–V9 (objective/method/command/result/status) consolidating what was scattered in README + State Log; embeds the 6-DOF + capture-range figures. README trimmed to "Balanced": 3-row headline table, one-paragraph clinical-faithfulness summary (full audit → VALIDATION.md), concise Validation section (4 highlights + tool image), removed the big Results section + duplicate tables. docs/ added to the layout tree. |
 | 2026-07-20 | Phase 5p: image-based tool/TCP pose recovery (PoC) | ✅ New bridge/register_tool_pose.py + run_register_tool.sh + plot_tool_pose.py. Renders the endo360 tool stamp as its OWN differentiable volume and optimizes its 6-DOF pose (per-view gantry composition, same Adam loop as anatomy) to match the observed silhouette — image-based tool pose INDEPENDENT of FK. Self-contained: only needs output/tool_stamp.npy + GPU, no CT. Corrects the memory "blocked" note: NOT blocked — the non-differentiable scipy affine (paint_stamp_into_mu) was only for baking tool into anatomy; rendering the tool as its own volume with differentiable pose inputs works. KEY FIX: the transmittance silhouette loss (normalize=False, invert=False) does NOT need the Slang gradient sign-flip that the anatomy normalize=True/invert=True path needs — FLIP_GRAD default 0 (with flip it diverges/ascends). Init = FK prior + residual (thin rod → small basin → refinement, not blind global search). Result (init 5.8mm/5.6°, 200 iters): multi-view TCP tip 0.113mm, pointing 0.0001°, perp-to-axis 0.0001mm; ENTIRE residual is along-axis (0.113mm) — rod's weakly-constrained slide DOF, analogous to roll. Single-view 3.23mm/1.28° (depth ambiguity, mirrors V3). Docs: VALIDATION.md V10 + docs/images/tool_pose_recovery.png. Follow-ons: FK-fallback fusion, live scene, DRR_NOISE. |
+| 2026-08-16 | Phase 7: minimal ROS 2 / RViz visualization bridge (first cut) | ✅ New ros/ dir: fluoro_tf_bridge.py (rclpy) reads output/robot_to_anatomy.json → broadcasts TF (anatomy→tool = recovered T_robot_in_anatomy; anatomy→carm = inverse recovered T_anatomy_in_carm) + MarkerArray (/fluoro_markers): CT surface mesh (spine_mesh.obj, metres), tool shaft+tip, C-arm source + beam line, text panel (reg ‖err‖ + clinical check). Re-reads JSON @5Hz → live update (tracking-loop hook). ros/fluoro_scene.rviz + ros/run_rviz.sh. ROS 2 Humble already installed at /opt/ros/humble (no sudo needed); rviz2/robot_state_publisher/tf2_ros/rclpy all present. Verified headless: /tf + /fluoro_markers publish; tf2_echo anatomy→tool = (-0.092,0.036,-0.001) m = recovered tip. Clean SIGINT (ExternalShutdownException guard). No STAR URDF available (arm is USD-only) → robot shown via tool markers + TF frames; URDF is a follow-on. |
 
 ---
 

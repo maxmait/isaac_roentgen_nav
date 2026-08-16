@@ -365,6 +365,10 @@ isaac_roentgen_nav/
 │   ├── build_tool_stamp.py            # host: voxelize EE-local mesh → tool_stamp.npy
 │   ├── ct_loader.py                   # DICOM CT → PreprocessedVolume (cropped or full)
 │   └── run_load_ct.sh                 # one-time CT cache builder
+├── ros/                               # Phase 7 — ROS 2 / RViz visualization
+│   ├── fluoro_tf_bridge.py            # rclpy: transforms → TF tree + RViz markers
+│   ├── fluoro_scene.rviz              # RViz config (fixed frame = anatomy)
+│   └── run_rviz.sh                    # source ROS + launch bridge + rviz2
 ├── docs/
 │   ├── VALIDATION.md                  # full test record (methods, configs, results)
 │   └── images/                        # committed reference images for this README
@@ -453,13 +457,15 @@ isaac_roentgen_nav/
   are weakly constrained, as expected for a thin rod). Remaining: a
   confidence-based FK fallback (use the image pose when the tool is in-frame and
   confident, else the calibration term) and live-scene validation.
-- **ROS / RViz visualization** — publish the recovered transforms as a ROS 2 TF
-  tree (`T_R^A`, `T_A^C`, `T_R^C`) with the STAR robot URDF, the CT anatomy as a
-  mesh marker, and the C-arm + recovered tool as frames, viewed live in RViz. A
-  minimal `rviz2` + TF-broadcaster node (reading `robot_to_anatomy.json`) covers
-  the core visualization; **Isaac ROS** adds the live Isaac Sim ↔ ROS bridge and
-  GPU perception once the real-time tracking loop is in place. This is also the
-  natural substrate for the trajectory-planning goal below (MoveIt).
+- **ROS 2 / RViz visualization** — ✅ *minimal bridge done (`ros/`)*. A rclpy
+  node reads `robot_to_anatomy.json` and broadcasts the recovered transforms as
+  a TF tree (`anatomy → tool`, `anatomy → carm`) with the CT anatomy mesh, the
+  recovered tool, and the C-arm + beam as RViz markers — re-read live at 5 Hz.
+  Run with `ros/run_rviz.sh`. Follow-ons: the full STAR arm via a URDF +
+  `robot_state_publisher` (only the tool is drawn for now), and **Isaac ROS**
+  for a live Isaac Sim ↔ ROS bridge once the real-time tracking loop exists.
+  This TF tree is also the natural substrate for the trajectory-planning goal
+  below (MoveIt).
 - **Neural-network acceleration (Phase 6)** — use the pipeline as a data
   generator (random poses → DRR pairs) to train a pose-regression network that
   provides an instant registration initializer (or a full estimate), removing the
